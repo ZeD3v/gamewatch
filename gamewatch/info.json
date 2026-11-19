@@ -1,0 +1,31 @@
+{
+    "name": "GameWatch",
+    "author": [
+        "TheD3v_"
+    ],
+    "description": "Per-game server status and patch note announcements for League of Legends, Teamfight Tactics, VALORANT, Counter-Strike 2, Escape from Tarkov, ARC Raiders and Arena Breakout: Infinite. Posts to dedicated per-game channels with optional role pings.",
+    "short": "Game status and patch notes in per-game channels.",
+    "end_user_data_statement": "This cog does not persistently store any data or metadata about users. It stores per-guild channel, role and region configuration only.",
+    "install_msg": "Thanks for installing GameWatch!\n\nSet up per-game channels:\n`[p]gamewatch news lol #lol-patch-notes`\n`[p]gamewatch status lol #lol-status`\n`[p]gamewatch games` lists every supported key.\n\nLoL and TFT default to the EUNE region (`eun1`); change with `[p]gamewatch region <game> <region>`.",
+    "min_bot_version": "3.5.0",
+    "min_python_version": [
+        3,
+        10,
+        0
+    ],
+    "hidden": false,
+    "disabled": false,
+    "required_cogs": {},
+    "requirements": [],
+    "tags": [
+        "games",
+        "status",
+        "patchnotes",
+        "news",
+        "riot",
+        "steam",
+        "valorant",
+        "tarkov"
+    ],
+    "type": "COG"
+}

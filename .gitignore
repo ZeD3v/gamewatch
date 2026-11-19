@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Local runtime state / snapshots (e.g. live Red settings.json from NAS)
+local/
+settings.json
+
+# OS / editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp

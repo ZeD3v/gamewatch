@@ -1,0 +1,32 @@
+[project]
+name = "gamewatch"
+version = "1.0.0"
+description = "Per-game server status and patch notes cog for Red-DiscordBot"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10,<3.12"
+
+[dependency-groups]
+dev = [
+    "Red-DiscordBot>=3.5.0,<3.6",
+    "pip",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.11",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]

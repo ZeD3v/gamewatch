@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_live_smoke:
+        description: "Run live upstream smoke tests (selftest + rendertest)"
+        type: boolean
+        default: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: uv sync --frozen || uv sync
+
+      - name: Lint and format check with ruff
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Run offline test suite
+        run: uv run pytest -v
+
+      - name: Verify standalone selftest imports without redbot/discord.py
+        run: |
+          uv run --no-project --with aiohttp python -c '
+          import gamewatch.constants
+          import gamewatch.sources
+          assert "lol" in gamewatch.constants.GAMES
+          print("Standalone sources import OK")
+          '
+
+  live-smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: uv sync --frozen || uv sync
+
+      - name: Run live source self-test
+        run: uv run python scripts/selftest.py
+
+      - name: Run live embed render test
+        run: uv run python scripts/rendertest.py
