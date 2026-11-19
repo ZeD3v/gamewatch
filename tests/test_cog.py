@@ -1,4 +1,4 @@
-"""Red-DiscordBot cog lifecycle, hybrid commands, and state-machine tests."""
+"""Red-DiscordBot cog lifecycle, hybrid commands, concurrency, migration & state tests."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import pytest
 import gamewatch
 from gamewatch import gamewatch as module
 from gamewatch.constants import GAMES
+from gamewatch.sources import FetchError
 
 
 class _ValueCtx:
@@ -106,17 +107,23 @@ class FakeBot:
         return self._embed_requested_result
 
 
-def _make_parsed(ok: bool, uid: str = "incident-1", severity: str = "warning") -> dict:
+def _make_parsed(
+    ok: bool,
+    uid: str = "incident-1",
+    severity: str = "warning",
+    maintenance_status: str | None = None,
+) -> dict:
     items = (
         []
-        if ok
+        if ok and maintenance_status is None
         else [
             {
                 "uid": uid,
-                "kind": "incidents",
+                "kind": "maintenances" if maintenance_status else "incidents",
                 "id": 1,
                 "severity": severity,
-                "title": "Login errors",
+                "maintenance_status": maintenance_status,
+                "title": "Planned maintenance" if maintenance_status else "Login errors",
                 "body": "Players may fail to log in.",
                 "platforms": ["windows"],
                 "created_at": None,
@@ -139,6 +146,7 @@ def _loc_parsed(locs: list[str], *, extra_unlocated: bool = False) -> dict:
             "kind": "incidents",
             "id": loc,
             "severity": "warning",
+            "maintenance_status": None,
             "title": "Game Server Unavailable",
             "body": (
                 "The following game server location is currently "
@@ -157,6 +165,7 @@ def _loc_parsed(locs: list[str], *, extra_unlocated: bool = False) -> dict:
                 "kind": "incidents",
                 "id": 99,
                 "severity": "critical",
+                "maintenance_status": None,
                 "title": "Region outage",
                 "body": "Players cannot log in.",
                 "platforms": [],
@@ -207,6 +216,7 @@ async def test_hybrid_commands_channel_types_and_autocomplete(patched_config) ->
     # Autocomplete callbacks filter cleanly
     all_games = await cog._game_autocomplete(None, "")  # type: ignore[arg-type]
     assert len(all_games) == len(GAMES)
+    assert any(c.value == "robrun" for c in all_games)
 
     status_games = await cog._status_game_autocomplete(None, "")  # type: ignore[arg-type]
     assert {c.value for c in status_games} == {"lol", "tft", "valorant", "eft"}
@@ -219,6 +229,73 @@ async def test_hybrid_commands_channel_types_and_autocomplete(patched_config) ->
 
     act_choices = await cog._location_action_autocomplete(None, "re")  # type: ignore[arg-type]
     assert {c.value for c in act_choices} == {"remove", "reset"}
+
+    await cog.cog_unload()
+
+
+async def test_region_autocomplete_and_retired_region_guard(patched_config, monkeypatch) -> None:
+    cog = module.GameWatch(FakeBot())  # type: ignore[arg-type]
+
+    lol_inter = SimpleNamespace(namespace=SimpleNamespace(game="lol"))
+    tft_inter = SimpleNamespace(namespace=SimpleNamespace(game="TFT"))
+
+    lol_regions = {c.value for c in await cog._region_autocomplete(lol_inter, "")}  # type: ignore[arg-type]
+    tft_regions = {c.value for c in await cog._region_autocomplete(tft_inter, "")}  # type: ignore[arg-type]
+    union_regions = await cog._region_autocomplete(None, "")  # type: ignore[arg-type]
+
+    assert {"kr1", "ru1", "pbe"}.issubset(lol_regions)
+    assert "ph2" not in lol_regions and "th2" not in lol_regions
+    assert {"kr", "ru", "pbe1"}.issubset(tft_regions)
+    assert "ph2" not in tft_regions and "th2" not in tft_regions
+    assert len(union_regions) <= 25
+    assert all(c.value not in ("ph2", "th2") for c in union_regions)
+
+    # Retired region must be rejected BEFORE making any HTTP call
+    called = False
+
+    async def fail_if_called(*args, **kwargs):
+        nonlocal called
+        called = True
+        return None, {}, 200
+
+    monkeypatch.setattr(module, "fetch_riot_status", fail_if_called)
+
+    sent_msgs: list[str] = []
+
+    class FakeCtx:
+        guild = SimpleNamespace(id=1)
+
+        async def send(self, content=None, **kwargs):
+            sent_msgs.append(str(content))
+
+    await cog.gw_region.callback(cog, FakeCtx(), "lol", "ph2")  # type: ignore[arg-type]
+    assert not called
+    assert any("sg2" in m for m in sent_msgs)
+
+    # For VALORANT, ph2 is NOT redirected to invalid sg2; proceeds to Riot validation
+    sent_msgs.clear()
+
+    async def fake_val_404(*args, **kwargs):
+        nonlocal called
+        called = True
+        return None, {}, 404
+
+    monkeypatch.setattr(module, "fetch_riot_status", fake_val_404)
+
+    class FakeValCtx(FakeCtx):
+        def typing(self):
+            class _Noop:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _Noop()
+
+    await cog.gw_region.callback(cog, FakeValCtx(), "valorant", "ph2")  # type: ignore[arg-type]
+    assert called
+    assert all("sg2" not in m for m in sent_msgs)
 
     await cog.cog_unload()
 
@@ -248,6 +325,116 @@ async def test_seen_ring_migration_and_bootstrap_order(patched_config) -> None:
     assert await cog._is_seen("news", "valorant", "riot-79") is True
     assert await cog._is_seen("news", "valorant", "riot-149") is False
     assert (await cog.config.bootstrapped())["valorant"] is True
+
+    await cog.cog_unload()
+
+
+async def test_uid_migration_lol_en_gb_legacy_keys_and_empty_ring_no_spam(
+    patched_config, monkeypatch
+) -> None:
+    bot = FakeBot()
+    guild = SimpleNamespace(id=1, name="g1")
+    bot.guilds = [guild]
+    cog = module.GameWatch(bot)  # type: ignore[arg-type]
+
+    # Configure channels for lol, cs2, abi
+    async with cog.config.guild(guild).games() as g:
+        g["lol"] = {"news_channel": 11, "enabled": True}
+        g["cs2"] = {"news_channel": 22, "enabled": True}
+        g["abi"] = {"news_channel": 33, "enabled": True}
+
+    # Pre-upgrade state:
+    # - lol has legacy un-namespaced seen["lol"] with /en-gb/ URL
+    # - cs2 has legacy un-namespaced seen["cs2"] with old steam-123
+    # - abi is bootstrapped=True with EMPTY seen["news:abi"] = []
+    async with cog.config.bootstrapped() as boot:
+        boot["lol"] = True
+        boot["cs2"] = True
+        boot["abi"] = True
+    async with cog.config.seen() as sn:
+        sn["lol"] = [
+            "riotnews-lol-https://www.leagueoflegends.com/en-gb/news/game-updates/patch-26-23-notes"
+        ]
+        sn["cs2"] = ["steam-12345"]
+        sn["news:abi"] = []
+
+    announced: list[tuple[str, str]] = []
+
+    async def fake_announce(game, item, targets):
+        announced.append((game, item["uid"]))
+
+    cog._announce_news = fake_announce  # type: ignore[method-assign]
+
+    # Poll 1: empty items for abi first -> must NOT clear or break migration
+    poll_num = 0
+
+    async def fake_fetch_news(session, game, *, validator=None):
+        if game == "lol":
+            return (
+                [
+                    {
+                        "uid": "riotnews-lol-https://www.leagueoflegends.com/en-us/news/game-updates/patch-26-24-notes",
+                        "title": "Patch 26.24 Notes",
+                    },
+                    {
+                        "uid": "riotnews-lol-https://www.leagueoflegends.com/en-us/news/game-updates/patch-26-23-notes",
+                        "title": "Patch 26.23 Notes",
+                    },
+                ],
+                {},
+                200,
+            )
+        if game == "cs2":
+            items = [{"uid": "steam-ev-100", "title": "CS2 Update"}]
+            if poll_num >= 2:
+                items.insert(0, {"uid": "steam-ev-200", "title": "New CS2 Update"})
+            return items, {}, 200
+        if game == "abi":
+            if poll_num == 1:
+                return [], {}, 200
+            items = [{"uid": "abi-cms-old", "content_id": "old", "title": "Old Live Update"}]
+            if poll_num >= 3:
+                items.insert(
+                    0, {"uid": "abi-cms-new", "content_id": "new", "title": "New Live Update"}
+                )
+            return items, {}, 200
+        return [], {}, 200
+
+    monkeypatch.setattr(module, "fetch_game_news", fake_fetch_news)
+    monkeypatch.setattr(
+        module, "fetch_abi_news_detail", lambda s, cid: asyncio.sleep(0, result=None)
+    )
+
+    # Poll 1:
+    # - lol migrates /en-gb/ -> /en-us/ in-place, suppresses 26.23, announces brand-new 26.24!
+    # - cs2 silently re-seeds steam-ev-100 (0 announcements)
+    # - abi gets [] (returns False, does nothing)
+    poll_num = 1
+    await cog._check_news_once()
+    assert announced == [
+        (
+            "lol",
+            "riotnews-lol-https://www.leagueoflegends.com/en-us/news/game-updates/patch-26-24-notes",
+        )
+    ]
+    sn = await cog.config.seen()
+    assert "lol" not in sn and "cs2" not in sn
+    assert "steam-ev-100" in sn["news:cs2"]
+
+    # Poll 2:
+    # - cs2 announces brand-new steam-ev-200
+    # - abi sees first non-empty items while seen["news:abi"] == [] -> silently re-seeds
+    announced.clear()
+    poll_num = 2
+    await cog._check_news_once()
+    assert announced == [("cs2", "steam-ev-200")]
+    assert "abi-cms-old" in (await cog.config.seen())["news:abi"]
+
+    # Poll 3: abi announces brand-new abi-cms-new
+    announced.clear()
+    poll_num = 3
+    await cog._check_news_once()
+    assert announced == [("abi", "abi-cms-new")]
 
     await cog.cog_unload()
 
@@ -324,6 +511,256 @@ async def test_status_debounce_recovery_and_location_filter(patched_config) -> N
     ).isoformat()
     await cog._process_status("valorant", "eu", dict(bad_far), ltargets)  # type: ignore[arg-type]
     assert recovered == ["eu"]
+
+    await cog.cog_unload()
+
+
+async def test_scheduled_maintenance_independent_debounce_and_coexistence(patched_config) -> None:
+    cog = module.GameWatch(FakeBot())  # type: ignore[arg-type]
+    announced: list[str] = []
+    recovered: list[str] = []
+
+    async def fake_incident(game, region, parsed, item, targets):
+        announced.append(item["uid"])
+
+    async def fake_recovery(game, region, parsed, targets):
+        recovered.append(region)
+
+    cog._announce_incident = fake_incident  # type: ignore[method-assign]
+    cog._announce_recovery = fake_recovery  # type: ignore[method-assign]
+
+    sched = _make_parsed(True, uid="maint-sched-1", severity="info", maintenance_status="scheduled")
+    clean = _make_parsed(True)
+
+    # 1-poll scheduled blip followed by clean resets _pending_scheduled
+    await cog._process_status("lol", "eun1", sched, [])
+    assert cog._pending_scheduled.get("lol-eun1") == 1
+    assert announced == []
+    await cog._process_status("lol", "eun1", clean, [])
+    assert cog._pending_scheduled.get("lol-eun1") is None
+
+    # 2 consecutive polls announce scheduled notice once WITHOUT setting last_status ok=False
+    await cog._process_status("lol", "eun1", sched, [])
+    assert announced == []
+    await cog._process_status("lol", "eun1", sched, [])
+    assert announced == ["maint-sched-1"]
+    assert (await cog.config.last_status()).get("lol-eun1", {}).get("ok", True) is True
+
+    # Clearing scheduled notice emits ZERO recovery
+    await cog._process_status("lol", "eun1", clean, [])
+    assert recovered == []
+
+    # Simultaneous active incident + scheduled notice; active clearing fires recovery
+    announced.clear()
+    active_and_sched = {
+        "region_id": "EUN1",
+        "region_name": "EU Nordic & East",
+        "ok": False,
+        "items": [
+            _make_parsed(False, uid="inc-active-1")["items"][0],
+            _make_parsed(
+                True, uid="maint-sched-2", severity="info", maintenance_status="scheduled"
+            )["items"][0],
+        ],
+    }
+    await cog._process_status("lol", "eun1", active_and_sched, [])
+    await cog._process_status("lol", "eun1", active_and_sched, [])
+    assert set(announced) == {"inc-active-1", "maint-sched-2"}
+
+    ls = await cog.config.last_status()
+    ls["lol-eun1"]["since"] = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
+    ).isoformat()
+    # Active clears while scheduled remains -> recovery MUST fire!
+    sched2_only = _make_parsed(
+        True, uid="maint-sched-2", severity="info", maintenance_status="scheduled"
+    )
+    announced.clear()
+    await cog._process_status("lol", "eun1", sched2_only, [])
+    assert recovered == ["eun1"]
+    assert announced == []  # maint-sched-2 not re-announced
+
+    # Transition scheduled -> in_progress announces warning after 2 polls and later recovers
+    inprog = _make_parsed(
+        False, uid="maint-inprog-2", severity="warning", maintenance_status="in_progress"
+    )
+    recovered.clear()
+    await cog._process_status("lol", "eun1", inprog, [])
+    assert announced == []
+    await cog._process_status("lol", "eun1", inprog, [])
+    assert announced == ["maint-inprog-2"]
+    assert cog._pending_scheduled.get("lol-eun1") is None
+
+    ls = await cog.config.last_status()
+    ls["lol-eun1"]["since"] = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=10)
+    ).isoformat()
+    await cog._process_status("lol", "eun1", clean, [])
+    assert recovered == ["eun1"]
+
+    await cog.cog_unload()
+
+
+async def test_concurrent_loops_isolate_failures_validators_and_lazy_abi_detail(
+    patched_config, monkeypatch
+) -> None:
+    bot = FakeBot()
+    guild = SimpleNamespace(id=1, name="g1")
+    bot.guilds = [guild]
+    cog = module.GameWatch(bot)  # type: ignore[arg-type]
+
+    async with cog.config.guild(guild).games() as g:
+        g["lol"] = {"news_channel": 11, "status_channel": 101, "region": "eun1", "enabled": True}
+        g["abi"] = {"news_channel": 22, "enabled": True}
+        g["eft"] = {"status_channel": 102, "region": "global", "enabled": True}
+    async with cog.config.bootstrapped() as boot:
+        boot["lol"] = True
+        boot["abi"] = True
+    async with cog.config.seen() as sn:
+        sn["news:lol"] = ["riotnews-lol-old"]
+        sn["news:abi"] = ["abi-cms-seen1"]
+
+    # News loop: lol fails while abi succeeds; detail called ONLY for unseen item
+    detail_calls: list[str] = []
+    announced_items: list[dict] = []
+
+    async def fake_fetch_news(session, game, *, validator=None):
+        if game == "lol":
+            raise FetchError("riot boom")
+        if game == "abi":
+            return (
+                [
+                    {
+                        "uid": "abi-cms-new1",
+                        "content_id": "new1",
+                        "title": "Nov. 10 Live Update",
+                        "body": "Preview fallback",
+                    },
+                    {
+                        "uid": "abi-cms-seen1",
+                        "content_id": "seen1",
+                        "title": "Oct. 27 Live Update",
+                        "body": "Old preview",
+                    },
+                ],
+                {},
+                200,
+            )
+        return [], {}, 200
+
+    async def fake_abi_detail(session, content_id):
+        detail_calls.append(content_id)
+        return "<p>Rich HTML notes</p>"
+
+    async def fake_announce_news(game, item, targets):
+        announced_items.append(item)
+
+    monkeypatch.setattr(module, "fetch_game_news", fake_fetch_news)
+    monkeypatch.setattr(module, "fetch_abi_news_detail", fake_abi_detail)
+    cog._announce_news = fake_announce_news  # type: ignore[method-assign]
+
+    await cog._check_news_once()
+    assert cog._failures.get("news-lol") == 1
+    assert detail_calls == ["new1"]  # NEVER called for seen1!
+    assert len(announced_items) == 1
+    assert announced_items[0]["raw_html"] == "<p>Rich HTML notes</p>"
+
+    # Detail returning None degrades cleanly to preview body
+    async def fail_abi_detail(session, content_id):
+        return None
+
+    async def fake_fetch_news_2(session, game, *, validator=None):
+        if game == "abi":
+            return (
+                [
+                    {
+                        "uid": "abi-cms-new2",
+                        "content_id": "new2",
+                        "title": "Update 2",
+                        "body": "Fallback",
+                    }
+                ],
+                {},
+                200,
+            )
+        return None, {}, 304
+
+    monkeypatch.setattr(module, "fetch_game_news", fake_fetch_news_2)
+    monkeypatch.setattr(module, "fetch_abi_news_detail", fail_abi_detail)
+    announced_items.clear()
+    await cog._check_news_once()
+    assert len(announced_items) == 1
+    assert "raw_html" not in announced_items[0]
+    assert announced_items[0]["body"] == "Fallback"
+
+    # Status loop: stores CacheValidator (etag + last_modified) & feeds cached parse on 304
+    status_calls = 0
+    seen_validators: list[dict] = []
+    status_announced: list[str] = []
+
+    async def fake_fetch_status(session, game, region, *, validator=None):
+        nonlocal status_calls
+        if game == "lol":
+            status_calls += 1
+            seen_validators.append(dict(validator or {}))
+            if status_calls == 1:
+                return (
+                    _make_parsed(False, uid="inc-304"),
+                    {"etag": '"e1"', "last_modified": "Thu, 19 Nov 2026 10:00:00 GMT"},
+                    200,
+                )
+            return None, {"etag": '"e1"', "last_modified": "Thu, 19 Nov 2026 10:00:00 GMT"}, 304
+        return _make_parsed(True), {}, 200
+
+    async def fake_announce_inc(game, region, parsed, item, targets):
+        status_announced.append(item["uid"])
+
+    monkeypatch.setattr(module, "fetch_game_status", fake_fetch_status)
+    cog._announce_incident = fake_announce_inc  # type: ignore[method-assign]
+
+    await cog._check_status_once()
+    assert cog._validators["status-lol-eun1"] == {
+        "etag": '"e1"',
+        "last_modified": "Thu, 19 Nov 2026 10:00:00 GMT",
+    }
+    assert status_announced == []  # pending=1
+
+    # Poll 2 returns 304 -> validator was sent AND cached parse confirms pending=2!
+    await cog._check_status_once()
+    assert seen_validators[1] == {"etag": '"e1"', "last_modified": "Thu, 19 Nov 2026 10:00:00 GMT"}
+    assert status_announced == ["inc-304"]
+
+    # Unexpected non-FetchError Exception in one game must be isolated without aborting others
+    async def boom_lol_ok_abi(session, game, *, validator=None):
+        if game == "lol":
+            raise RuntimeError("unexpected parser crash")
+        return [], {}, 200
+
+    monkeypatch.setattr(module, "fetch_game_news", boom_lol_ok_abi)
+    prev_fails = cog._failures.get("news-lol", 0)
+    await cog._check_news_once()
+    assert cog._failures["news-lol"] == prev_fails + 1
+    assert cog._last_health["news-abi"]["http"] == 200
+
+    # CancelledError must propagate cleanly
+    async def cancelled_fetch(session, game, *, validator=None):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(module, "fetch_game_news", cancelled_fetch)
+    with pytest.raises(asyncio.CancelledError):
+        await cog._check_news_once()
+
+    # resetseen must clear cached validators so next poll re-bootstraps instead of getting 304
+    cog._validators["news-lol"] = {"last_modified": "Thu, 19 Nov 2026 10:00:00 GMT"}
+    cog._validators["status-lol-eun1"] = {"etag": '"e1"'}
+
+    class FakeResetCtx:
+        async def send(self, content=None, **kwargs):
+            return None
+
+    await cog.gw_resetseen.callback(cog, FakeResetCtx(), "lol")  # type: ignore[arg-type]
+    assert "news-lol" not in cog._validators
+    assert "status-lol-eun1" not in cog._validators
 
     await cog.cog_unload()
 

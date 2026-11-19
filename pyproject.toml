@@ -1,6 +1,6 @@
 [project]
 name = "gamewatch"
-version = "1.0.0"
+version = "2.0.0"
 description = "Per-game server status and patch notes cog for Red-DiscordBot"
 readme = "README.md"
 license = { file = "LICENSE" }

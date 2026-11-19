@@ -6,8 +6,9 @@ import asyncio
 import io
 import logging
 import re
+import time
 from datetime import datetime, timezone
-from typing import Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 import aiohttp
 import discord
@@ -16,7 +17,14 @@ from redbot.core import Config, app_commands, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import box, humanize_list, pagify
 
-from .constants import DEFAULT_LOCATION_ALLOW, GAMES, RIOT_SEVERITY_ORDER, USER_AGENT
+from .constants import (
+    DEFAULT_LOCATION_ALLOW,
+    GAMES,
+    RIOT_RETIRED_REGIONS,
+    RIOT_SEVERITY_ORDER,
+    RIOT_VALID_REGIONS,
+    USER_AGENT,
+)
 from .embeds import (
     accent_int,
     embed_to_plain_text,
@@ -29,14 +37,14 @@ from .embeds import (
 from .sources import (
     FetchError,
     extract_location,
-    fetch_eft_status,
-    fetch_riot_news,
+    fetch_abi_news_detail,
+    fetch_game_news,
+    fetch_game_status,
     fetch_riot_status,
-    fetch_steam_news,
     filter_status_view,
     location_allowed,
 )
-from .types import NewsItem, ParsedStatus
+from .types import CacheValidator, NewsItem, ParsedStatus
 
 log = logging.getLogger("red.zed3v.gamewatch")
 
@@ -50,18 +58,19 @@ CONFIRM_POLLS = 2  # consecutive bad polls before announcing an incident
 RECOVERY_MIN_SECONDS = 120  # suppress "recovered" for blips shorter than this
 MAX_SEEN_PER_GAME = 80  # ring buffer of announced uids
 FAILURE_ALERT_AFTER = 12  # consecutive errors before the owner is DMed
+FETCH_CONCURRENCY = 6  # max simultaneous upstream requests per loop pass
 
 
 class GameWatch(commands.Cog):
     """Per-game server status and patch notes for LoL, TFT, VALORANT, CS2, EFT,
-    ARC Raiders and Arena Breakout.
+    ARC Raiders, Arena Breakout and ROB RUN.
 
     Status and news are posted to separate, per-game channels. Nothing is
     announced until a channel has been configured for that game.
     """
 
     __author__ = "TheD3v_"
-    __version__ = "1.0.0"
+    __version__ = "2.0.0"
 
     def __init__(self, bot: Red) -> None:
         self.bot = bot
@@ -72,25 +81,26 @@ class GameWatch(commands.Cog):
             ping_severity="warning",
         )
         self.config.register_global(
-            seen={},  # game -> [uid, ...]
+            seen={},  # namespace:game -> [uid, ...]
             bootstrapped={},  # game -> bool (cold-start guard)
-            last_status={},  # game -> {"ok": bool, "since": iso, "items": [...]}
+            last_status={},  # game-region -> {"ok": bool, "since": iso}
         )
 
         self.session: Optional[aiohttp.ClientSession] = None
-        self._etags: dict[str, str] = {}
-        self._pending: dict[str, int] = {}  # game -> consecutive bad polls
+        self._validators: dict[str, CacheValidator] = {}
+        self._last_health: dict[str, dict[str, Any]] = {}
+        self._pending: dict[str, int] = {}  # game-region -> consecutive active bad polls
+        self._pending_scheduled: dict[str, int] = {}  # game-region -> consecutive scheduled polls
         # Last successful parse per status source, so a 304 (unchanged payload)
         # can still be fed through the debounce/recovery state machine.
-        self._last_parsed: dict[str, dict] = {}
+        self._last_parsed: dict[str, ParsedStatus] = {}
         self._failures: dict[str, int] = {}  # source key -> consecutive errors
         self._alerted: set[str] = set()
         # One lock per pipeline, serialising each loop against a manual
         # [p]gamewatch forcecheck (unlocked, both could pass _is_seen before
         # either marks, announcing the same item twice). Deliberately NOT one
-        # shared lock: news fetches use 30s timeouts, and a hung news upstream
-        # must never stall the 90s status loop - outage detection matters most
-        # exactly when upstreams are degraded.
+        # shared lock: news fetches use up to 30s timeouts, and a hung news
+        # upstream must never stall the 90s status loop.
         self._status_lock = asyncio.Lock()
         self._news_lock = asyncio.Lock()
 
@@ -99,17 +109,11 @@ class GameWatch(commands.Cog):
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
                 headers={"User-Agent": USER_AGENT},
-                # Default ttl_dns_cache is 10s; every host would be re-resolved on
-                # each 90s poll. Keepalive across 90s gaps is not winnable, so DNS
-                # TTL is the only connector knob worth setting.
                 connector=aiohttp.TCPConnector(ttl_dns_cache=300, limit=20),
             )
         return self.session
 
     async def cog_load(self) -> None:
-        # Starting the session and loops here (not __init__) means a failed
-        # add_cog never leaks running tasks or an open ClientSession - the
-        # modern discord.py/Red 3.5 idiom.
         self._get_session()
         self.status_loop.start()
         self.news_loop.start()
@@ -121,8 +125,6 @@ class GameWatch(commands.Cog):
     async def cog_unload(self) -> None:
         self.status_loop.cancel()
         self.news_loop.cancel()
-        # Give a mid-request iteration a moment to unwind before the session
-        # is pulled out from under it.
         for lock in (self._status_lock, self._news_lock):
             try:
                 await asyncio.wait_for(lock.acquire(), timeout=5)
@@ -155,12 +157,7 @@ class GameWatch(commands.Cog):
     async def _targets(
         self, game: str, field: str, all_guilds: Optional[dict] = None
     ) -> list[tuple[discord.Guild, dict]]:
-        """All (guild, cfg) pairs that have a channel configured for this game.
-
-        Pass a prefetched ``await self.config.all_guilds()`` mapping from loop
-        code so one Config read serves every game in the pass, instead of one
-        deepcopied read per guild per game.
-        """
+        """All (guild, cfg) pairs that have a channel configured for this game."""
         if all_guilds is None:
             all_guilds = await self.config.all_guilds()
         out = []
@@ -173,11 +170,6 @@ class GameWatch(commands.Cog):
                 out.append((guild, cfg))
         return out
 
-    # Seen-uid rings are namespaced "news:{game}" / "status:{game}". Sharing
-    # one ring per game let Riot incident-update churn (each update mints a new
-    # uid, one per watched region) evict still-announceable news uids, causing
-    # duplicate patch-note posts. The legacy un-namespaced "{game}" key is
-    # migrated on first write.
     @staticmethod
     def _seen_key(namespace: str, game: str) -> str:
         return f"{namespace}:{game}"
@@ -197,7 +189,6 @@ class GameWatch(commands.Cog):
         key = self._seen_key(namespace, game)
         async with self.config.seen() as seen:
             if game in seen and self._seen_key("news", game) not in seen:
-                # One-time migration: the legacy ring held news uids.
                 seen[self._seen_key("news", game)] = seen.pop(game)
             entries = seen.setdefault(key, [])
             entries.append(uid)
@@ -210,6 +201,60 @@ class GameWatch(commands.Cog):
         return uid in (seen.get(self._seen_key(namespace, game)) or []) or (
             namespace == "news" and uid in legacy
         )
+
+    async def _migrate_seen_if_needed(self, game: str, items: list[NewsItem]) -> bool:
+        """One-time upgrade guard when a game's news source/UID namespace changes.
+
+        Returns True ONLY when silent re-seeding occurred and the caller must
+        skip announcing on this poll.
+        """
+        key = self._seen_key("news", game)
+        prefix = GAMES[game]["uid_prefix"]
+
+        async with self.config.seen() as seen:
+            # 1. Fold any legacy un-namespaced seen[game] ring into seen["news:{game}"].
+            if game in seen:
+                legacy = seen.pop(game) or []
+                existing = seen.get(key) or []
+                merged = list(dict.fromkeys([*legacy, *existing]))
+                seen[key] = merged[-MAX_SEEN_PER_GAME:]
+
+            # 2. Empty feed poll: never clear existing UIDs or trigger migration yet.
+            if not items:
+                return False
+
+            entries = seen.get(key) or []
+
+            # 3. LoL en-gb -> en-us in-place rewrite preserves exact seen history
+            #    so brand-new patches still announce on the very same poll.
+            if game == "lol" and any("://www.leagueoflegends.com/en-gb/" in u for u in entries):
+                rewritten = list(
+                    dict.fromkeys(
+                        u.replace(
+                            "://www.leagueoflegends.com/en-gb/",
+                            "://www.leagueoflegends.com/en-us/",
+                        )
+                        for u in entries
+                    )
+                )
+                seen[key] = rewritten[-MAX_SEEN_PER_GAME:]
+                log.info("GameWatch migrated %s seen ring from en-gb to en-us", game)
+                return False
+
+            # 4. Disjoint namespace upgrade (e.g. steam-* -> steam-ev-*/eft-bsg-*/abi-cms-*)
+            #    or empty ring while already bootstrapped: silently re-seed once.
+            if not any(u.startswith(prefix) for u in entries):
+                seeded = [i["uid"] for i in reversed(items)]
+                seen[key] = seeded[-MAX_SEEN_PER_GAME:]
+                log.info(
+                    "GameWatch migrated %s seen ring to %s namespace (%s items)",
+                    game,
+                    prefix,
+                    len(items),
+                )
+                return True
+
+        return False
 
     async def _note_failure(self, key: str, detail: str | Exception) -> None:
         self._failures[key] = self._failures.get(key, 0) + 1
@@ -288,9 +333,6 @@ class GameWatch(commands.Cog):
         if not can_send:
             log.warning("Missing send permission in #%s (%s)", channel.name, channel.guild.name)
             return
-        # Only the explicitly configured role may resolve. roles=True would let
-        # a "<@&id>" string inside upstream-controlled article text ping
-        # arbitrary roles (Steam/Riot bodies are third-party content).
         role_objs = []
         if ping_role:
             role = channel.guild.get_role(ping_role)
@@ -304,15 +346,11 @@ class GameWatch(commands.Cog):
             if use_embed:
                 await channel.send(content=content, embed=embed, allowed_mentions=allowed)
             else:
-                # No embed permission or embeds disabled via [p]embedset:
-                # degrade cleanly to markdown rather than staying silent.
                 text = embed_to_plain_text(embed)
                 full = f"{content}\n{text}" if content else text
                 for page in pagify(full.strip(), page_length=1990):
                     await channel.send(content=page, allowed_mentions=allowed)
         except discord.HTTPException as exc:
-            # 50035 = Invalid Form Body, i.e. an embed that slipped past the
-            # size guard. Retry once as plain text so the update is not lost.
             log.exception("Failed sending to #%s (%s)", channel.name, exc)
             if getattr(exc, "code", None) == 50035:
                 try:
@@ -324,15 +362,13 @@ class GameWatch(commands.Cog):
                     log.exception("Plain-text fallback also failed for #%s", channel.name)
 
     # ------------------------------------------------------------------
-    # status loop
+    # status loop (2-phase: bounded concurrent fetch -> sequential state)
     # ------------------------------------------------------------------
     @tasks.loop(seconds=STATUS_INTERVAL)
     async def status_loop(self) -> None:
         try:
             await self._check_status_once()
         except Exception:
-            # tasks.loop stops on uncaught errors; a flaky upstream must not
-            # kill the loop, so log and carry on.
             log.exception("Unhandled error in status loop")
 
     @status_loop.before_loop
@@ -345,51 +381,76 @@ class GameWatch(commands.Cog):
 
     async def _check_status_inner(self) -> None:
         all_guilds = await self.config.all_guilds()
+        jobs: list[tuple[str, str, list[tuple[discord.Guild, dict]]]] = []
         for game, cfg in GAMES.items():
             if cfg["status_kind"] is None:
                 continue
             targets = await self._targets(game, "status_channel", all_guilds)
             if not targets:
                 continue
-
-            # Region is per-guild, but the upstream call is per-region: group.
-            regions = {(gcfg.get("region") or cfg["default_region"]) for _, gcfg in targets}
+            regions = sorted({(gcfg.get("region") or cfg["default_region"]) for _, gcfg in targets})
             for region in regions:
-                key = f"status-{game}-{region}"
-                session = self._get_session()
-                try:
-                    if cfg["status_kind"] == "riot":
-                        parsed, etag, http = await fetch_riot_status(
-                            session, game, region, self._etags.get(key)
-                        )
-                    else:
-                        parsed, etag, http = await fetch_eft_status(session, self._etags.get(key))
-                except FetchError as exc:
-                    await self._note_failure(key, exc)
-                    continue
+                jobs.append((game, region, targets))
 
-                if http == 304:
-                    self._note_success(key)
-                    # 304 means the payload is byte-identical to the last 200,
-                    # so the parsed state is unchanged - but the debounce and
-                    # recovery logic still has to SEE that state on every poll.
-                    # Skipping _process_status here would freeze the pending
-                    # counter at 1 forever for any incident Riot does not
-                    # actively update, so a sustained outage would never be
-                    # announced. Re-process the cached parse instead.
-                    cached = self._last_parsed.get(key)
-                    if cached is not None:
-                        await self._process_status(game, region, cached, targets)
-                    continue
-                if http != 200 or parsed is None:
-                    await self._note_failure(key, f"HTTP {http}")
-                    continue
+        if not jobs:
+            return
 
+        session = self._get_session()
+        sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+        async def _fetch_one(
+            game: str, region: str
+        ) -> tuple[Optional[ParsedStatus], CacheValidator, int, int]:
+            key = f"status-{game}-{region}"
+            validator = dict(self._validators.get(key) or {})
+            async with sem:
+                t0 = time.monotonic()
+                parsed, new_val, http = await fetch_game_status(
+                    session, game, region, validator=validator or None
+                )
+                ms = int((time.monotonic() - t0) * 1000)
+                return parsed, new_val, http, ms
+
+        results = await asyncio.gather(
+            *(_fetch_one(game, region) for game, region, _ in jobs),
+            return_exceptions=True,
+        )
+        # Only propagate fatal non-Exception BaseExceptions (e.g. CancelledError);
+        # isolate ordinary Exceptions per source in Phase 2 so one broken upstream
+        # never aborts healthy games or skips failure-streak accounting.
+        for res in results:
+            if isinstance(res, BaseException) and not isinstance(res, Exception):
+                raise res
+
+        # Phase 2: deterministic sequential state updates and announcements.
+        for (game, region, targets), res in zip(jobs, results, strict=True):
+            key = f"status-{game}-{region}"
+            if isinstance(res, Exception):
+                if not isinstance(res, FetchError):
+                    log.exception("Unexpected error fetching %s", key, exc_info=res)
+                self._last_health[key] = {"http": 0, "ms": 0}
+                await self._note_failure(key, res)
+                continue
+
+            parsed, new_val, http, ms = res
+            self._last_health[key] = {"http": http, "ms": ms}
+            if http == 304:
                 self._note_success(key)
-                if etag:
-                    self._etags[key] = etag
-                self._last_parsed[key] = parsed
-                await self._process_status(game, region, parsed, targets)
+                if new_val:
+                    self._validators[key] = new_val
+                cached = self._last_parsed.get(key)
+                if cached is not None:
+                    await self._process_status(game, region, cached, targets)
+                continue
+            if http != 200 or parsed is None:
+                await self._note_failure(key, f"HTTP {http}")
+                continue
+
+            self._note_success(key)
+            if new_val:
+                self._validators[key] = new_val
+            self._last_parsed[key] = parsed
+            await self._process_status(game, region, parsed, targets)
 
     async def _process_status(
         self,
@@ -400,10 +461,7 @@ class GameWatch(commands.Cog):
     ) -> None:
         state_key = f"{game}-{region}"
 
-        # Location filter: build the effective view for this region's targets.
-        # Union semantics - an incident allowed by ANY matching-region guild
-        # counts as region-degraded; zero matching targets => no filtering
-        # (also keeps the statetest harness, which passes targets=[], intact).
+        # Location filter: union semantics across guilds watching this region.
         cfg = GAMES[game]
         region_targets = [
             (g, gc)
@@ -412,16 +470,9 @@ class GameWatch(commands.Cog):
         ]
         if region_targets:
             allowlists = [self._effective_allowlist(gc, game) for _, gc in region_targets]
-            if any(not a for a in allowlists):
-                pass  # some guild disables the filter -> full view for the union
-            else:
+            if not any(not a for a in allowlists):
                 union: list[str] = sorted({loc for a in allowlists for loc in a})
                 parsed = filter_status_view(parsed, union)
-                # Mark filtered uids seen NOW, before the ok early-return below
-                # (all-filtered flips ok True and returns early). Guarded by
-                # _is_seen so a lingering filtered incident polled every 90s
-                # is appended once, not every poll - unguarded appends would
-                # flood the 80-slot ring and evict real incident uids.
                 for item in parsed.get("filtered_items") or []:
                     region_uid = f"{region}:{item['uid']}"
                     if not await self._is_seen("status", game, region_uid):
@@ -434,6 +485,25 @@ class GameWatch(commands.Cog):
                         parsed["filtered_count"],
                     )
 
+        all_items = parsed.get("items") or []
+        scheduled_items = [i for i in all_items if i.get("maintenance_status") == "scheduled"]
+        active_items = [i for i in all_items if i.get("maintenance_status") != "scheduled"]
+
+        # Step A: Independent scheduled-maintenance debounce (never mutates last_status
+        # or triggers bogus "Services back to normal" recoveries).
+        if scheduled_items:
+            self._pending_scheduled[state_key] = self._pending_scheduled.get(state_key, 0) + 1
+            if self._pending_scheduled[state_key] >= CONFIRM_POLLS:
+                for item in scheduled_items:
+                    region_uid = f"{region}:{item['uid']}"
+                    if await self._is_seen("status", game, region_uid):
+                        continue
+                    await self._announce_incident(game, region, parsed, item, targets)
+                    await self._mark_seen("status", game, region_uid)
+        else:
+            self._pending_scheduled.pop(state_key, None)
+
+        # Step B: Active service health, incident debounce, and outage recovery.
         last = (await self.config.last_status()).get(state_key) or {}
         was_ok = last.get("ok", True)
         now = datetime.now(timezone.utc)
@@ -441,7 +511,6 @@ class GameWatch(commands.Cog):
         if parsed["ok"]:
             self._pending.pop(state_key, None)
             if not was_ok:
-                # Degraded -> healthy transition.
                 since = last.get("since")
                 long_enough = True
                 if since:
@@ -452,24 +521,16 @@ class GameWatch(commands.Cog):
                         pass
                 if long_enough:
                     await self._announce_recovery(game, region, parsed, targets)
-                # Persist only the transition; rewriting an identical healthy
-                # record every 90s per game/region is pointless disk churn.
                 async with self.config.last_status() as store:
                     store[state_key] = {"ok": True, "since": now.isoformat()}
             return
 
-        # Degraded. Debounce so a single blip does not fire an alert.
         self._pending[state_key] = self._pending.get(state_key, 0) + 1
         if self._pending[state_key] < CONFIRM_POLLS:
             log.debug("Status for %s degraded, awaiting confirmation", state_key)
             return
 
-        for item in parsed["items"]:
-            # Scope dedupe per region: the same Riot incident id can appear in
-            # several regions' status documents, and guilds are filtered by
-            # region inside _announce_incident - a game-global uid would let
-            # the first region processed swallow the announcement for all
-            # the others.
+        for item in active_items:
             region_uid = f"{region}:{item['uid']}"
             if await self._is_seen("status", game, region_uid):
                 continue
@@ -492,9 +553,6 @@ class GameWatch(commands.Cog):
         for guild, gcfg in targets:
             if (gcfg.get("region") or cfg.get("default_region")) != region:
                 continue
-            # Per-guild location check: _process_status applies union semantics
-            # across all guilds watching this region, so a guild that disables
-            # filtering must not leak filtered locations into other guilds.
             if not location_allowed(item, self._effective_allowlist(gcfg, game)):
                 continue
             channel = self._resolve_channel(guild, gcfg.get("status_channel"))
@@ -519,9 +577,6 @@ class GameWatch(commands.Cog):
 
     async def _announce_recovery(self, game: str, region: str, parsed: dict, targets: list) -> None:
         cfg = GAMES[game]
-        # Surface how long the outage lasted, read back from the state store
-        # that the status loop maintains. Key format must match
-        # _process_status: "{game}-{region}".
         state_key = f"{game}-{region}"
         down_since = None
         stored = (await self.config.last_status()).get(state_key) or {}
@@ -539,7 +594,7 @@ class GameWatch(commands.Cog):
                 await self._send(channel, embed)
 
     # ------------------------------------------------------------------
-    # news loop
+    # news loop (2-phase: bounded concurrent fetch -> sequential state)
     # ------------------------------------------------------------------
     @tasks.loop(seconds=NEWS_INTERVAL)
     async def news_loop(self) -> None:
@@ -551,8 +606,6 @@ class GameWatch(commands.Cog):
     @news_loop.before_loop
     async def _news_before(self) -> None:
         await self.bot.wait_until_red_ready()
-        # Stagger behind the status loop's first pass so both pipelines do not
-        # burst-fetch at the same moment on startup.
         await asyncio.sleep(10)
 
     async def _check_news_once(self) -> None:
@@ -560,19 +613,7 @@ class GameWatch(commands.Cog):
             await self._check_news_inner()
 
     async def _bootstrap_seen(self, game: str, items: list[NewsItem]) -> None:
-        """Cold start: record every visible item WITHOUT announcing.
-
-        A fresh install or a cleared ring must not dump the last 20 patch
-        notes into the channel.
-
-        IMPORTANT: mark in chronological order (oldest first). The seen list
-        is a ring buffer trimmed from the FRONT, so whatever is appended last
-        survives. Riot feeds return ~150 items newest-first; appending in feed
-        order would push the NEWEST uids out of the ring and make the next
-        poll re-announce months-old patch notes. Steam feeds are short enough
-        that the bug never showed there. One Config transaction, not one per
-        item.
-        """
+        """Cold start: record every visible item WITHOUT announcing (oldest first)."""
         key = self._seen_key("news", game)
         async with self.config.seen() as seen:
             entries = seen.setdefault(key, [])
@@ -586,44 +627,85 @@ class GameWatch(commands.Cog):
     async def _check_news_inner(self) -> None:
         bootstrapped = await self.config.bootstrapped()
         all_guilds = await self.config.all_guilds()
-        for game, cfg in GAMES.items():
+        jobs: list[tuple[str, list[tuple[discord.Guild, dict]]]] = []
+        for game in GAMES:
             targets = await self._targets(game, "news_channel", all_guilds)
-            if not targets:
-                continue
+            if targets:
+                jobs.append((game, targets))
+
+        if not jobs:
+            return
+
+        session = self._get_session()
+        sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+        async def _fetch_one(
+            game: str,
+        ) -> tuple[Optional[list[NewsItem]], CacheValidator, int, int]:
             key = f"news-{game}"
-            session = self._get_session()
-            try:
-                if cfg["news_kind"] == "steam":
-                    items, etag, http = await fetch_steam_news(
-                        session, game, etag=self._etags.get(key)
-                    )
-                else:
-                    items, etag, http = await fetch_riot_news(
-                        session, game, etag=self._etags.get(key)
-                    )
-            except FetchError as exc:
-                await self._note_failure(key, exc)
+            validator = dict(self._validators.get(key) or {})
+            async with sem:
+                t0 = time.monotonic()
+                items, new_val, http = await fetch_game_news(
+                    session, game, validator=validator or None
+                )
+                ms = int((time.monotonic() - t0) * 1000)
+                return items, new_val, http, ms
+
+        results = await asyncio.gather(
+            *(_fetch_one(game) for game, _ in jobs),
+            return_exceptions=True,
+        )
+        for res in results:
+            if isinstance(res, BaseException) and not isinstance(res, Exception):
+                raise res
+
+        # Phase 2: deterministic sequential state updates and announcements.
+        for (game, targets), res in zip(jobs, results, strict=True):
+            key = f"news-{game}"
+            cfg = GAMES[game]
+            if isinstance(res, Exception):
+                if not isinstance(res, FetchError):
+                    log.exception("Unexpected error fetching %s", key, exc_info=res)
+                self._last_health[key] = {"http": 0, "ms": 0}
+                await self._note_failure(key, res)
                 continue
 
+            items, new_val, http, ms = res
+            self._last_health[key] = {"http": http, "ms": ms}
             if http == 304:
                 self._note_success(key)
+                if new_val:
+                    self._validators[key] = new_val
                 continue
             if http != 200 or items is None:
                 await self._note_failure(key, f"HTTP {http}")
                 continue
 
             self._note_success(key)
-            if etag:
-                self._etags[key] = etag
+            if new_val:
+                self._validators[key] = new_val
 
             if not bootstrapped.get(game):
                 await self._bootstrap_seen(game, items)
                 continue
 
+            if await self._migrate_seen_if_needed(game, items):
+                continue
+
             for item in reversed(items[:10]):
                 if await self._is_seen("news", game, item["uid"]):
                     continue
-                await self._announce_news(game, item, targets)
+                to_send: NewsItem = item
+                if (
+                    cfg["news_kind"] == "abi_cms"
+                    and item.get("content_id")
+                    and not item.get("raw_html")
+                ):
+                    detail_html = await fetch_abi_news_detail(session, item["content_id"])
+                    if detail_html:
+                        to_send = {**item, "raw_html": detail_html}
+                await self._announce_news(game, to_send, targets)
                 await self._mark_seen("news", game, item["uid"])
 
     async def _announce_news(
@@ -678,6 +760,21 @@ class GameWatch(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         return self._matching_game_choices(current, riot_only=True)
+
+    async def _region_autocomplete(
+        self, interaction: Optional[discord.Interaction], current: str
+    ) -> list[app_commands.Choice[str]]:
+        raw_game = (
+            (getattr(getattr(interaction, "namespace", None), "game", None) or "").lower().strip()
+        )
+        if raw_game in RIOT_VALID_REGIONS:
+            pool = RIOT_VALID_REGIONS[raw_game]
+        else:
+            pool = tuple(sorted({r for regions in RIOT_VALID_REGIONS.values() for r in regions}))
+        needle = current.lower().strip()
+        return [
+            app_commands.Choice(name=reg, value=reg) for reg in pool if not needle or needle in reg
+        ][:25]
 
     async def _severity_autocomplete(
         self, interaction: discord.Interaction, current: str
@@ -737,14 +834,17 @@ class GameWatch(commands.Cog):
                 inline=False,
             )
         embed.set_footer(
-            text="ARC Raiders and Arena Breakout publish no status API, so they are news only."
+            text=(
+                "CS2, ARC Raiders, Arena Breakout and ROB RUN publish no keyless status API, "
+                "so they are patch notes only."
+            )
         )
         await self._send_ctx_embed(ctx, fit_embed(embed))
 
     @gamewatch.command(name="news")
     @commands.admin_or_permissions(manage_guild=True)
     @app_commands.describe(
-        game="Game key (e.g. lol, cs2, valorant)",
+        game="Game key (e.g. lol, cs2, valorant, robrun)",
         channel="Channel or thread for patch notes (omit to disable)",
     )
     @app_commands.autocomplete(game=_game_autocomplete)
@@ -784,7 +884,7 @@ class GameWatch(commands.Cog):
             )
         if GAMES[game]["status_kind"] is None:
             return await ctx.send(
-                f"{GAMES[game]['name']} has no public status API, so status monitoring "
+                f"{GAMES[game]['name']} has no public keyless status API, so status monitoring "
                 "is not available for it. Patch notes still work."
             )
         async with self.config.guild(ctx.guild).games() as games:
@@ -800,7 +900,7 @@ class GameWatch(commands.Cog):
     @gamewatch.command(name="role")
     @commands.admin_or_permissions(manage_guild=True)
     @app_commands.describe(
-        game="Game key (e.g. lol, cs2, valorant)",
+        game="Game key (e.g. lol, cs2, valorant, robrun)",
         role="Role to ping on announcements (omit to clear)",
     )
     @app_commands.autocomplete(game=_game_autocomplete)
@@ -825,12 +925,12 @@ class GameWatch(commands.Cog):
         game="Riot game key (lol, tft, valorant)",
         region="Riot region ID (e.g. eun1, euw1, na1 for LoL/TFT; eu, na, ap for VALORANT)",
     )
-    @app_commands.autocomplete(game=_riot_game_autocomplete)
+    @app_commands.autocomplete(game=_riot_game_autocomplete, region=_region_autocomplete)
     async def gw_region(self, ctx: commands.Context, game: str, region: str) -> None:
         """Set the region for a Riot game.
 
-        LoL and TFT use platform IDs (eun1, euw1, na1). VALORANT uses
-        deployments (eu, na, ap, br, kr, latam).
+        LoL and TFT use platform IDs (note: LoL uses kr1/ru1/pbe; TFT uses
+        kr/ru/pbe1). VALORANT uses deployments (eu, na, ap, br, kr, latam).
         """
         game = game.lower()
         if game not in GAMES or GAMES[game]["status_kind"] != "riot":
@@ -838,15 +938,24 @@ class GameWatch(commands.Cog):
         region = region.lower()
         if not re.fullmatch(r"[a-z0-9]{1,16}", region):
             return await ctx.send("Regions are short alphanumeric IDs like `eun1` or `eu`.")
+        if region in RIOT_RETIRED_REGIONS and RIOT_RETIRED_REGIONS[
+            region
+        ] in RIOT_VALID_REGIONS.get(game, ()):
+            replacement = RIOT_RETIRED_REGIONS[region]
+            return await ctx.send(
+                f"Region `{region}` has been retired by Riot and merged into `{replacement}`. "
+                f"Use `{replacement}` instead."
+            )
         async with ctx.typing():
             try:
                 parsed, _, http = await fetch_riot_status(self._get_session(), game, region)
             except FetchError as exc:
                 return await ctx.send(f"Could not reach Riot: {exc}")
         if http != 200 or parsed is None:
+            valid = ", ".join(f"`{r}`" for r in RIOT_VALID_REGIONS.get(game, ()))
             return await ctx.send(
-                f"Riot returned HTTP {http} for region `{region}`. "
-                "LoL/TFT want platform IDs like `eun1`; VALORANT wants `eu`."
+                f"Riot returned HTTP {http} for region `{region}`. Valid regions for "
+                f"{GAMES[game]['name']}: {valid}."
             )
         async with self.config.guild(ctx.guild).games() as games:
             games.setdefault(game, {})["region"] = region
@@ -870,18 +979,7 @@ class GameWatch(commands.Cog):
         *,
         location: Optional[str] = None,
     ) -> None:
-        """Manage the status location allowlist for a game.
-
-        Incidents naming a game-server location outside the allowlist are
-        suppressed (still deduped, never re-announced later). Incidents with
-        no recognisable location always announce.
-
-        `[p]gamewatch locations valorant` - show
-        `[p]gamewatch locations valorant add warsaw`
-        `[p]gamewatch locations valorant remove tokyo`
-        `[p]gamewatch locations valorant clear` - disable filtering
-        `[p]gamewatch locations valorant reset` - back to default
-        """
+        """Manage the status location allowlist for a game."""
         game = game.lower()
         if game not in GAMES or GAMES[game]["status_kind"] != "riot":
             return await ctx.send("Location filtering only applies to Riot status games.")
@@ -985,24 +1083,19 @@ class GameWatch(commands.Cog):
         cfg = GAMES[game]
         if cfg["status_kind"] is None:
             return await ctx.send(
-                f"{cfg['name']} publishes no status API. Only patch notes are available for it."
+                f"{cfg['name']} publishes no keyless status API. Only patch notes are available."
             )
         entry = await self._guild_game_cfg(ctx.guild, game)
         region = entry.get("region") or cfg["default_region"]
         async with ctx.typing():
             session = self._get_session()
             try:
-                if cfg["status_kind"] == "riot":
-                    parsed, _, http = await fetch_riot_status(session, game, region)
-                else:
-                    parsed, _, http = await fetch_eft_status(session)
+                parsed, _, http = await fetch_game_status(session, game, region)
             except FetchError as exc:
                 return await ctx.send(f"Fetch failed: {exc}")
         if http != 200 or parsed is None:
             return await ctx.send(f"Upstream returned HTTP {http}.")
 
-        # Apply this guild's location filter so check mirrors what the loop
-        # would announce; filtered incidents stay visible in a quiet field.
         allow = self._effective_allowlist(entry, game)
         view = filter_status_view(parsed, allow)
         embed = status_panel_embed(game, region, view)
@@ -1018,7 +1111,7 @@ class GameWatch(commands.Cog):
         await self._send_ctx_embed(ctx, embed)
 
     @gamewatch.command(name="latest")
-    @app_commands.describe(game="Game key (e.g. lol, cs2, valorant)")
+    @app_commands.describe(game="Game key (e.g. lol, cs2, valorant, robrun)")
     @app_commands.autocomplete(game=_game_autocomplete)
     async def gw_latest(self, ctx: commands.Context, game: str) -> None:
         """Show the most recent patch notes for a game."""
@@ -1029,16 +1122,22 @@ class GameWatch(commands.Cog):
         async with ctx.typing():
             session = self._get_session()
             try:
-                if cfg["news_kind"] == "steam":
-                    items, _, http = await fetch_steam_news(session, game)
-                else:
-                    items, _, http = await fetch_riot_news(session, game)
+                items, _, http = await fetch_game_news(session, game)
             except FetchError as exc:
                 return await ctx.send(f"Fetch failed: {exc}")
-        if http != 200 or not items:
-            return await ctx.send("Nothing found.")
+            if http != 200 or not items:
+                return await ctx.send("Nothing found.")
+            latest_item: NewsItem = items[0]
+            if (
+                cfg["news_kind"] == "abi_cms"
+                and latest_item.get("content_id")
+                and not latest_item.get("raw_html")
+            ):
+                detail_html = await fetch_abi_news_detail(session, latest_item["content_id"])
+                if detail_html:
+                    latest_item = {**latest_item, "raw_html": detail_html}
         await self._send_ctx_embed(
-            ctx, news_embed(game, items[0], accent=accent_int(items[0].get("accent")))
+            ctx, news_embed(game, latest_item, accent=accent_int(latest_item.get("accent")))
         )
 
     @gamewatch.command(name="diag")
@@ -1048,8 +1147,13 @@ class GameWatch(commands.Cog):
         all_guilds = await self.config.all_guilds()
         lines = []
         for game, cfg in GAMES.items():
-            news_fail = self._failures.get(f"news-{game}", 0)
-            lines.append(f"news-{game:9} failures={news_fail}")
+            nkey = f"news-{game}"
+            nhealth = self._last_health.get(nkey)
+            nstat = f" http={nhealth['http']} {nhealth['ms']}ms" if nhealth else ""
+            lines.append(
+                f"{nkey:16} kind={cfg['news_kind']:12} "
+                f"failures={self._failures.get(nkey, 0)}{nstat}"
+            )
             if cfg["status_kind"]:
                 regions = {
                     (gcfg.get("region") or cfg["default_region"])
@@ -1060,18 +1164,22 @@ class GameWatch(commands.Cog):
                 if not regions:
                     regions = {cfg["default_region"]}
                 for region in sorted(regions):
-                    key = f"status-{game}-{region}"
+                    skey = f"status-{game}-{region}"
+                    shealth = self._last_health.get(skey)
+                    sstat = f" http={shealth['http']} {shealth['ms']}ms" if shealth else ""
                     lines.append(
-                        f"status-{game}-{region:5} failures={self._failures.get(key, 0)} "
-                        f"pending={self._pending.get(f'{game}-{region}', 0)}"
+                        f"{skey:20} failures={self._failures.get(skey, 0)} "
+                        f"pending={self._pending.get(f'{game}-{region}', 0)} "
+                        f"sched={self._pending_scheduled.get(f'{game}-{region}', 0)}{sstat}"
                     )
         seen = await self.config.seen()
         boot = await self.config.bootstrapped()
         lines.append("")
-        lines.append(f"etags cached: {len(self._etags)}")
+        lines.append(f"validators cached: {len(self._validators)}")
         lines.append(f"seen uids: {sum(len(v) for v in seen.values())}")
         lines.append(f"bootstrapped: {sorted(k for k, v in boot.items() if v)}")
-        await ctx.send(box("\n".join(lines), lang="ini"))
+        for page in pagify("\n".join(lines), page_length=1900):
+            await ctx.send(box(page, lang="ini"))
 
     @gamewatch.command(name="forcecheck")
     @commands.is_owner()
@@ -1092,10 +1200,11 @@ class GameWatch(commands.Cog):
         if game not in GAMES:
             return await ctx.send("Unknown game.")
         async with self.config.seen() as seen:
-            # Clear every namespace for the game, including any legacy
-            # un-namespaced ring from before the news/status split.
             for key in (game, f"news:{game}", f"status:{game}"):
                 seen.pop(key, None)
         async with self.config.bootstrapped() as boot:
             boot[game] = False
+        self._validators.pop(f"news-{game}", None)
+        for skey in [k for k in self._validators if k.startswith(f"status-{game}-")]:
+            self._validators.pop(skey, None)
         await ctx.send(f"Dedupe history cleared for {GAMES[game]['name']}.")

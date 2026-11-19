@@ -4,13 +4,14 @@ Per-game server status and patch notes cog for [Red-DiscordBot](https://github.c
 
 | Game | Key | Status | Patch notes |
 |---|---|---|---|
-| League of Legends | `lol` | Riot CDN (EUNE default) | leagueoflegends.com |
-| Teamfight Tactics | `tft` | Riot CDN (EUNE default) | teamfighttactics.leagueoflegends.com |
-| VALORANT | `valorant` | Riot CDN (EU default) | playvalorant.com |
-| Counter-Strike 2 | `cs2` | — | Steam news (appid 730) |
-| Escape from Tarkov | `eft` | BSG status API | Steam news (appid 3932890) |
-| ARC Raiders | `arc` | — | Steam news (appid 1808500) |
-| Arena Breakout: Infinite | `abi` | — | Steam news (appid 2073620) |
+| League of Legends | `lol` | Riot CDN (EUNE default) | Riot PCS v2.0 JSON (`en-us`) + `leagueoflegends.com` fallback |
+| Teamfight Tactics | `tft` | Riot CDN (EUNE default) | Riot PCS v2.0 JSON (`tags/patch-notes`) + fallback |
+| VALORANT | `valorant` | Riot CDN (EU default) | Riot PCS v2.0 JSON (`tags/patch-notes`) + fallback |
+| Counter-Strike 2 | `cs2` | — | Steam Partner Events (appid 730) |
+| Escape from Tarkov | `eft` | BSG status API (services + datacenters + global + messages) | BSG official patch-notes JSON API (`escapefromtarkov.com`) |
+| ARC Raiders | `arc` | — | Steam Partner Events (appid 1808500) |
+| Arena Breakout: Infinite | `abi` | — | Official Level Infinite GPTS CMS JSON API (`arenabreakoutinfinite.com`) |
+| ROB RUN | `robrun` | — | Steam Partner Events (appid 4262460) |
 
 No API keys are required for any source.
 
@@ -43,8 +44,9 @@ To update later:
 ```
 
 Regions default to **EUNE** (`eun1`) for LoL and TFT and `eu` for VALORANT.
-Change with `[p]gamewatch region <game> <region>`; the command validates the
-region against Riot before saving.
+Change with `[p]gamewatch region <game> <region>`; the command provides
+per-game region autocomplete, rejects retired shards (`ph2`/`th2` → `sg2`), and
+validates against Riot before saving.
 
 ## Commands
 
@@ -58,7 +60,7 @@ region against Riot before saving.
 - `[p]gamewatch settings` — current configuration
 - `[p]gamewatch check <game>` — live status on demand
 - `[p]gamewatch latest <game>` — most recent patch notes
-- `[p]gamewatch diag` — (owner) fetch health per source
+- `[p]gamewatch diag` — (owner) fetch health, latency, and validator status per source
 - `[p]gamewatch forcecheck` — (owner) run both loops immediately
 - `[p]gamewatch resetseen <game>` — (owner) clear dedupe history
 
@@ -68,18 +70,26 @@ commands (with autocomplete and parameter descriptions) after `[p]slash sync`.
 
 ## Behaviour
 
-- **Status loop** every 90s, **news loop** every 15min, both with ETag /
-  `If-None-Match` conditional requests.
-- **Debounce**: an incident must appear in 2 consecutive polls before it is
-  announced, and a recovery is suppressed if the outage lasted under 2 minutes.
-  Riot flips on brief blips.
-- **Cold-start guard**: on first run per game, everything currently visible is
-  recorded as seen without posting, so installing or restarting never dumps the
-  last 20 patch notes into a channel.
+- **Bounded concurrent polling**: status loop every 90s, news loop every 15min,
+  fetching independent sources concurrently (`Semaphore(6)`) before applying
+  state updates sequentially so one slow upstream never stalls other games.
+- **Resilient HTTP transport**: supports both `ETag` (`If-None-Match`) and
+  `Last-Modified` (`If-Modified-Since`) conditional requests, bounded 4 MiB
+  response reads, and transient retries with exponential backoff, jitter, and
+  capped RFC 9110 `Retry-After` handling on network/timeout/429/5xx errors.
+- **Debounce & scheduled maintenance**: active incidents and in-progress
+  maintenances require 2 consecutive bad polls before announcing, and recovery
+  is suppressed for blips under 2 minutes. Scheduled future maintenances are
+  debounced independently as informational notices without falsely marking the
+  region down or emitting bogus recovery messages when they clear.
+- **Cold-start & upgrade migration guard**: on first run per game, currently
+  visible items are recorded as seen without posting. Upgrading from older
+  source UID namespaces silently migrates (`lol` `/en-gb/` → `/en-us/` in-place;
+  disjoint namespaces silently re-seed once) so upgrades never spam old patches.
 - **Dedupe** by stable uid, capped at 80 entries per game per namespace
   (`news:{game}` / `status:{game}`).
 - **Failure alerting**: after 12 consecutive failures for one source the bot
-  owner is DMed, so a silently-dead scraper is not mistaken for "no news".
+  owner is DMed, so a silently-dead source is not mistaken for "no news".
 - Respects Red's `[p]embedset` settings and falls back cleanly to plain text
   where embeds are disabled or the bot lacks Embed Links permission.
 
@@ -88,10 +98,18 @@ commands (with autocomplete and parameter descriptions) after `[p]slash sync`.
 - **End-User Data**: GameWatch does not persistently store any user data or
   metadata. It stores only per-guild channel, role, region, and location
   allowlist configuration plus global feed dedupe state via Red's `Config`.
-- **External Requests**: The cog makes read-only HTTPS GET requests to public
-  Riot CDN/news pages, the Steam Web API (`api.steampowered.com`), and
-  Battlestate Games' public status API (`status.escapefromtarkov.com`). No API
-  keys are required and no Discord user or server data is transmitted externally.
+- **External Requests**: The cog makes unauthenticated requests to public game
+  endpoints only (no API keys required, and no Discord user or server data is
+  transmitted externally):
+  - `GET` to Riot CDN status (`*.secure.dyn.riotcdn.net`), Riot Publishing
+    Content Service (`content.publishing.riotgames.com`), and Riot news HTML
+    fallback (`leagueoflegends.com`, `teamfighttactics.leagueoflegends.com`,
+    `playvalorant.com`).
+  - `GET` to Steam Store Partner Events (`store.steampowered.com/events/ajaxgetpartnereventspageable/`).
+  - `GET` to Battlestate Games' public status API (`status.escapefromtarkov.com/api/*`)
+    and official patch-notes API (`www.escapefromtarkov.com/site/api/v1/news-list/2/en`).
+  - `POST` (read-only JSON query) to Level Infinite's public GPTS CMS API
+    (`sg-community.playerinfinite.com`) for Arena Breakout: Infinite announcements.
 - **Support**: Report bugs or request games via
   [GitHub Issues](https://github.com/ZeD3v/gamewatch/issues).
 
@@ -120,22 +138,23 @@ messages keep working while far-away incidents linger.
 Patch notes are rendered as full Discord embeds, not link dumps:
 
 - **Author line** — game name + official icon, linking to the source site.
-- **Title** — the patch title, hyperlinked to the article.
-- **Description** — Steam BBCode is *converted* to Discord markdown, so
-  `[h2]`/`[list]` become real `##` headings and nested `-` bullets. CS2's
-  `\[ MAPS ]` section markers are promoted to headings too.
-- **Image** — Riot article hero art (requested as a 1200x675 crop from their
-  Sanity CDN) or the first inline image from a Steam announcement; falls back
-  to the Steam store header.
+- **Title** — the patch title, hyperlinked to the canonical article.
+- **Description** — Steam BBCode and BSG/Level Infinite CMS HTML are converted
+  to Discord markdown (`##`/`###` headings, nested bullets, emphasis, tables),
+  using stdlib `html.parser` with zero extra dependencies. CS2's `\[ MAPS ]`
+  section markers are promoted to headings too.
+- **Image** — Riot article hero art (1200x675 Sanity CDN crop), Steam 800x450
+  16:9 Partner Event capsule art, or official BSG/ABI article artwork; falls
+  back to inline article images and then the store header.
 - **Accent colour** — Riot publish a per-article primary colour in their CMS,
-  so each patch post matches its own artwork. Steam games use a fixed brand
+  so each patch post matches its own artwork. Other games use a fixed brand
   colour.
 - **Fields** — version, published (as a native `<t:...:R>` relative timestamp
   that renders in each member's own locale/timezone), author.
 
-Status embeds encode severity in **both** colour and a leading emoji, so
-alerts stay readable for colour-blind members. Recovery posts include the
-outage duration.
+Status embeds encode severity in **both** colour and a leading emoji, distinguish
+`Scheduled Maintenance` from `Maintenance in Progress`, and display both EFT
+services and regional datacenters. Recovery posts include the outage duration.
 
 ### Limits
 
@@ -144,54 +163,62 @@ description 4096, field value 1024, 25 fields, 6000 total) and `fit_embed()`
 trims before sending. If a send still fails with `50035 Invalid Form Body`,
 `_send()` retries once as plain text so an update is never silently lost.
 
-### Steam API trap
-
-`maxlength` **must be 0**. Any non-zero value makes Steam pre-flatten the
-announcement server-side: it strips every BBCode tag *and* joins lines with no
-separator, turning "Cache" + "Fixed various gaps" into "CacheFixed various
-gaps". Only `maxlength=0` returns the structured original.
-
 ## Source notes
 
-These were established by probing the live APIs; they are the non-obvious parts.
+These were established by probing the live APIs and inspecting official frontend
+bundles; they are the non-obvious parts.
 
-**Riot status** uses the public CDN feed that Riot's own status page consumes:
-`https://{host}.secure.dyn.riotcdn.net/channels/public/x/status/{region}.json`.
-The documented `*.api.riotgames.com/lol/status/v4/platform-data` endpoint needs
-a dev key that expires every 24h and is unusable for a long-running bot.
-Region identifiers are **not** consistent between games: LoL/TFT take platform
-IDs (`eun1`), VALORANT takes deployments (`eu`). The TFT host is the full word
-`teamfighttactics`; `tft` 404s.
+**Riot status** uses the exact public CDN feed that `status.riotgames.com`
+consumes (`https://{host}.secure.dyn.riotcdn.net/channels/public/x/status/{region}.json`,
+`Cache-Control: max-age=60`, true `304` on both `If-None-Match` and
+`If-Modified-Since`). Matching Riot's frontend bundle, updates are filtered to
+`publish != false` and `"riotstatus" in publish_locations` (dropping in-client
+tips and `riotclient`-only banners), expired `archive_at` and `"complete"`
+maintenances are dropped, updates are ordered explicitly by timestamp descending,
+and `uid` keys off the selected update rather than `raw.updated_at`. Region IDs
+differ between LoL (`kr1`, `ru1`, `pbe`) and TFT (`kr`, `ru`, `pbe1`), while
+`ph2`/`th2` were retired into `sg2`.
 
-**Riot patch notes** have no RSS. The article list is parsed out of the
-`__NEXT_DATA__` hydration blob on each news page. The `/_next/data/{buildId}/…`
-JSON route is faster but `buildId` rotates on every site deploy, so the HTML
-parse is used as the stable path.
+**Riot patch notes** use Riot's public Publishing Content Service v2.0 JSON API
+(`content.publishing.riotgames.com/publishing-content/v2.0/public/channel/...`),
+cutting wire transfer by 58–85% over Netlify's Next.js HTML pages (which ignore
+`If-None-Match`) with 100% item parity and automatic Next.js HTML fallback. LoL
+uses `en-us` (avoiding `en-gb` 404s and stray TFT cross-posts) and TFT uses
+`tags/patch-notes/` (recovering patches evicted by `game-updates/`'s 200-card
+cap).
 
-**Steam `&tags=patchnotes` is lossy and must not be used as the only filter.**
-Verified by diffing tagged vs untagged feeds:
+**Steam Partner Events (`cs2`, `arc`, `robrun`)** uses
+`store.steampowered.com/events/ajaxgetpartnereventspageable/` — the same backend
+powering the Steam Store News Hub and `counter-strike.net/news/updates`. Unlike
+`ISteamNews/GetNewsForApp/v2` (which edge-caches for 30–56 minutes, mixes in
+third-party press unless `&feeds=steam_community_announcements` is passed, and
+only auto-tags `event_type == 12` as `patchnotes`), Partner Events exposes
+Valve's full `event_type` enum (`12` Small Update, `13` Regular Update, `14`
+Major Update), 800×450 16:9 capsule art, and direct canonical `/news/app/{appid}/view/{event_gid}`
+URLs. Items are sorted client-side by `announcement_body.posttime` DESC because
+the server orders by `rtime32_start_time` DESC. On ARC Raiders, `"Store Update"`
+titles use a body-aware guard so real 7–11 KB gameplay patches pass while pure
+cosmetic shop rotations (0.2–2.7 KB) stay excluded.
 
-- CS2 — tag reliable (30/30).
-- ARC Raiders — **inverted**: cosmetic "Store Update" posts are tagged, the
-  real "Live Update" gameplay patches are not.
-- Escape from Tarkov — lossy; "Patch 1.1.5.0" and "Patch 1.1.0.0" untagged.
-- Arena Breakout — publisher applies no tags at all.
+**Escape from Tarkov** fetches all four `status.escapefromtarkov.com/api/`
+endpoints (`/services`, `/global/status`, `/message/list`, `/datacenter/list`)
+in one parallel `asyncio.gather()`, maps `message.type` (`0..3`) and ignores
+BSG's `"Access denied"` `global.message` quirk. Patch notes come directly from
+BSG's public JSON API (`escapefromtarkov.com/site/api/v1/news-list/2/en?page=1`,
+`type_id=2` = Patch Notes), delivering notes 6–20 hours ahead of Steam cross-posts
+with full HTML inline. (`api.tarkov.dev/graphql` returns HTTP 422.)
 
-So the cog fetches the untagged feed and filters client-side: keep if
-`tag matches OR title matches`, then veto with `exclude_filter`.
+**Arena Breakout: Infinite** uses Level Infinite's official GPTS CMS JSON API
+(`sg-community.playerinfinite.com`, `X-GameId: 30048`, `X-Source: pc_web`,
+`secondary_label_id: 1318` Announcement) with lazy `GetContentInfoById` detail
+fetches for unseen items only — MoreFun Studios stopped cross-posting routine
+Live Updates to Steam after July 2026.
 
-**Escape from Tarkov status** comes from BSG's own undocumented but public
-endpoints under `status.escapefromtarkov.com/api/`. Responses are served as
-`text/html` despite being JSON, so parsing must not gate on content type.
-Status integers map `0=OK, 1=Updating, 2=Unstable, 3=Down` (per
-the-hideout/tarkov-data-manager). tarkov.dev's GraphQL `status` query returns
-`GraphQL server unavailable` (HTTP 422) and is not used.
-
-**No status API exists for ARC Raiders or Arena Breakout: Infinite.**
-`status.arcraiders.com` and `status.embark-studios.com` are NXDOMAIN;
-`arcraiders.statuspage.io` and `embarkstudios.statuspage.io` are inactive
-placeholders. These two are news-only by design rather than guessing at
-outages from player counts and producing false alarms.
+**No keyless status API exists for CS2, ARC Raiders, Arena Breakout: Infinite,
+or ROB RUN.** Valve's `ICSGOServers_730/GetGameServersStatus/v1` requires a
+Steam Web API key (403 keyless), `GetSDRConfig` is static PoP topology only, and
+`steamstat.us` explicitly forbids third-party scraping. ARC, ABI, and ROB RUN
+have no official status hosts/APIs.
 
 ## Development & Tests
 
@@ -200,10 +227,11 @@ Set up a local Python 3.11 environment with [uv](https://docs.astral.sh/uv/):
 ```bash
 uv sync
 uv run ruff check .
+uv run ruff format --check .
 uv run pytest -v
 ```
 
-Live upstream smoke tests (hit Riot, Steam, and BSG directly):
+Live upstream smoke tests (hit Riot, Steam, BSG, and Level Infinite directly):
 
 ```bash
 uv run python scripts/selftest.py      # also works with aiohttp alone (no redbot/discord.py)
@@ -211,9 +239,10 @@ uv run python scripts/rendertest.py
 ```
 
 - `tests/` — offline pytest suite validating Red Downloader `info.json` schemas,
-  cog lifecycle, hybrid commands & autocomplete, parser fixtures, embed limits,
-  and the debounce/recovery/location-filter state machine.
+  HTTP transport/retry/size-guard, cog lifecycle, hybrid commands & autocomplete,
+  parser fixtures for all 8 games, BBCode/HTML embed limits, UID migration, and
+  the debounce/scheduled-maintenance/recovery/location-filter state machine.
 - `scripts/selftest.py` — hits every live upstream and exits non-zero on HTTP
   errors or zero filtered items (catches upstream redesigns).
 - `scripts/rendertest.py` — builds real embeds from live data and asserts every
-  Discord embed limit, including synthetic overflow and ReDoS guards.
+  Discord embed limit, including synthetic overflow and BBCode/HTML ReDoS guards.

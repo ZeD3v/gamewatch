@@ -4,6 +4,6 @@
         "TheD3v_"
     ],
     "short": "Per-game server status and patch notes cog for Red-DiscordBot.",
-    "description": "Repository containing GameWatch, a Red-DiscordBot cog that tracks live server status and patch notes for League of Legends, Teamfight Tactics, VALORANT, Counter-Strike 2, Escape from Tarkov, ARC Raiders, and Arena Breakout: Infinite.",
+    "description": "Repository containing GameWatch, a Red-DiscordBot cog that tracks live server status and patch notes for League of Legends, Teamfight Tactics, VALORANT, Counter-Strike 2, Escape from Tarkov, ARC Raiders, Arena Breakout: Infinite, and ROB RUN.",
     "install_msg": "Thanks for adding the GameWatch repository!\nInstall the cog with `[p]cog install gamewatch gamewatch` and load it with `[p]load gamewatch`."
 }

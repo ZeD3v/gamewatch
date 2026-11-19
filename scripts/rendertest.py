@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -23,17 +24,19 @@ from gamewatch.embeds import (
     MAX_FOOTER,
     MAX_TITLE,
     MAX_TOTAL,
+    _trunc,
     accent_int,
+    html_to_markdown,
     incident_embed,
     news_embed,
     recovery_embed,
     status_panel_embed,
+    steam_bbcode_to_markdown,
 )
 from gamewatch.sources import (
-    fetch_eft_status,
-    fetch_riot_news,
-    fetch_riot_status,
-    fetch_steam_news,
+    fetch_abi_news_detail,
+    fetch_game_news,
+    fetch_game_status,
 )
 
 REGIONS = {"lol": "eun1", "tft": "eun1", "valorant": "eu"}
@@ -82,21 +85,33 @@ async def main():
         print("NEWS EMBEDS")
         print("=" * 70)
         for game, cfg in GAMES.items():
-            if cfg["news_kind"] == "steam":
-                items, _, http = await fetch_steam_news(session, game)
-            else:
-                items, _, http = await fetch_riot_news(session, game)
+            items, _, http = await fetch_game_news(session, game)
             if not items:
                 print(f"  {game}: NO ITEMS (http {http})")
                 failures.append((game, ["no items"]))
                 continue
-            # Test the newest three, not just one - long CS2 notes are the
-            # ones most likely to breach a limit.
-            for item in items[:3]:
-                acc = accent_int(item.get("accent"))
-                e = check(f"{game}/{item['title'][:22]}", news_embed(game, item, acc))
-            print(f"    -> sample desc head: {(e.description or '')[:120]!r}")
-            print(f"    -> image: {(e.image.url or '')[:90] if e.image else None}")
+            sample_embed = None
+            for idx, item in enumerate(items[:3]):
+                to_render = item
+                if (
+                    idx == 0
+                    and cfg["news_kind"] == "abi_cms"
+                    and item.get("content_id")
+                    and not item.get("raw_html")
+                ):
+                    detail_html = await fetch_abi_news_detail(session, item["content_id"])
+                    if not detail_html:
+                        failures.append((game, ["abi detail empty"]))
+                    else:
+                        to_render = {**item, "raw_html": detail_html}
+                acc = accent_int(to_render.get("accent"))
+                sample_embed = check(
+                    f"{game}/{to_render['title'][:22]}", news_embed(game, to_render, acc)
+                )
+            if sample_embed is not None:
+                print(f"    -> sample desc head: {(sample_embed.description or '')[:120]!r}")
+                img_url = (sample_embed.image.url or "")[:90] if sample_embed.image else None
+                print(f"    -> image: {img_url}")
 
         print()
         print("=" * 70)
@@ -106,10 +121,7 @@ async def main():
             if not cfg["status_kind"]:
                 continue
             region = REGIONS.get(game, cfg["default_region"])
-            if cfg["status_kind"] == "riot":
-                parsed, _, http = await fetch_riot_status(session, game, region)
-            else:
-                parsed, _, http = await fetch_eft_status(session)
+            parsed, _, http = await fetch_game_status(session, game, region)
             if not parsed:
                 failures.append((game, [f"status http {http}"]))
                 continue
@@ -118,10 +130,10 @@ async def main():
             for item in (parsed.get("items") or [])[:2]:
                 check(f"{game}/incident", incident_embed(game, region, parsed, item))
 
-        # Synthetic worst case: an oversized incident must be trimmed, not raise.
+        # Synthetic worst case: oversized incidents, services, datacenters, BBCode & HTML.
         print()
         print("=" * 70)
-        print("SYNTHETIC OVERFLOW")
+        print("SYNTHETIC OVERFLOW & REDOS")
         print("=" * 70)
         huge = {
             "title": "X" * 400,
@@ -134,35 +146,50 @@ async def main():
             "ok": False,
             "items": [huge],
             "services": [{"name": f"svc{i}", "status": 3, "label": "Down"} for i in range(30)],
+            "datacenters": [
+                {"name": f"Server {i}", "region": f"Region {i}", "status": 3, "label": "Down"}
+                for i in range(30)
+            ],
         }
         check("overflow/incident", incident_embed("lol", "eun1", parsed, huge))
         check("overflow/panel", status_panel_embed("lol", "eun1", parsed))
         check(
-            "overflow/news",
+            "overflow/news-bbcode",
             news_embed("cs2", {"title": "Y" * 500, "raw_bbcode": "[p]a[/p]" * 3000}),
         )
+        check(
+            "overflow/news-html",
+            news_embed("eft", {"title": "Z" * 500, "raw_html": "<p>entry</p>" * 3000}),
+        )
 
-        # Oversized third-party region_name must be clamped everywhere it is
-        # interpolated (author, title, Region field).
         evil_region = {"region_name": "R" * 600, "ok": False, "items": [huge], "services": []}
         check("overflow/region-author", incident_embed("lol", "eun1", evil_region, huge))
         check("overflow/region-title", status_panel_embed("lol", "eun1", evil_region))
         check("overflow/region-recovery", recovery_embed("lol", "eun1", evil_region, None))
 
-        # ReDoS guard: crafted unclosed-tag payload must convert fast.
-        import time as _time
+        for label, hostile_bb in (
+            ("unclosed-bold", "[b]" * 60000),
+            ("deep-list", "[list]" * 1333 + "[*]" * 2666),
+        ):
+            start = time.monotonic()
+            steam_bbcode_to_markdown(hostile_bb)
+            elapsed_bb = time.monotonic() - start
+            if elapsed_bb > 0.5:
+                failures.append((f"redos-bbcode-{label}", [f"conversion took {elapsed_bb:.2f}s"]))
+            print(f"  redos bbcode ({label}): converted in {elapsed_bb:.3f}s")
 
-        from gamewatch.embeds import steam_bbcode_to_markdown
-
-        start = _time.monotonic()
-        steam_bbcode_to_markdown("[b]" * 60000)
-        elapsed = _time.monotonic() - start
-        if elapsed > 2.0:
-            failures.append(("redos", [f"conversion took {elapsed:.1f}s"]))
-        print(f"  redos guard: 180KB hostile payload converted in {elapsed:.3f}s")
-
-        # Truncation must not leave unbalanced markdown pair tokens.
-        from gamewatch.embeds import _trunc
+        for label, hostile_html in (
+            ("nested-tags", "<b><div>" * 25000),
+            ("unbalanced-inline", "<b>" * 20000 + "</i>" * 15000),
+            ("deep-links", "<a>" * 15000 + "<i>" * 15000),
+            ("deep-list-heading", "<ul>" * 15000 + "<h1>" + "<li>" * 5000),
+        ):
+            start = time.monotonic()
+            html_to_markdown(hostile_html)
+            elapsed_html = time.monotonic() - start
+            if elapsed_html > 0.5:
+                failures.append((f"redos-html-{label}", [f"conversion took {elapsed_html:.2f}s"]))
+            print(f"  redos html ({label}): converted in {elapsed_html:.3f}s")
 
         cut = _trunc("start **bold text that will be cut " + "x" * 100, 40)
         if cut.count("**") % 2:

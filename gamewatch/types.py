@@ -5,6 +5,13 @@ from __future__ import annotations
 from typing import Optional, TypedDict
 
 
+class CacheValidator(TypedDict, total=False):
+    """HTTP conditional-request validators returned by an upstream."""
+
+    etag: Optional[str]
+    last_modified: Optional[str]
+
+
 class StatusItem(TypedDict, total=False):
     """One incident or maintenance item from a status source."""
 
@@ -12,6 +19,7 @@ class StatusItem(TypedDict, total=False):
     kind: str  # "incidents" | "maintenances"
     id: object  # upstream id, opaque
     severity: str  # "info" | "warning" | "critical"
+    maintenance_status: Optional[str]  # "scheduled" | "in_progress" | None
     title: str
     body: str
     platforms: list[str]
@@ -27,6 +35,8 @@ class ParsedStatus(TypedDict, total=False):
     region_name: Optional[str]
     items: list[StatusItem]
     services: list[dict]
+    datacenters: list[dict]
+    global_message: Optional[str]
     worst: int
     # Populated by sources.filter_status_view (location allowlist):
     filtered_count: int
@@ -34,10 +44,10 @@ class ParsedStatus(TypedDict, total=False):
 
 
 class NewsItem(TypedDict, total=False):
-    """One patch note from Steam or a Riot news page.
+    """One patch note from Steam, Riot, BSG, or Level Infinite CMS.
 
-    Steam items carry timestamp (unix); Riot items carry published_at
-    (ISO 8601). embeds._parse_ts handles both.
+    Steam and ABI items carry timestamp (unix); Riot and EFT BSG items carry
+    published_at (ISO 8601). embeds._parse_ts handles both.
     """
 
     uid: str
@@ -45,6 +55,8 @@ class NewsItem(TypedDict, total=False):
     url: str
     body: str
     raw_bbcode: str
+    raw_html: str
+    content_id: str
     author: str
     timestamp: int
     published_at: str
