@@ -88,10 +88,16 @@ class FakeConfig:
 
 
 class FakeBot:
-    def __init__(self, *, embed_requested_result: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        embed_requested_result: bool = True,
+        api_tokens: dict[str, dict[str, str]] | None = None,
+    ) -> None:
         self.guilds: list = []
         self.added_cogs: list = []
         self._embed_requested_result = embed_requested_result
+        self.api_tokens: dict[str, dict[str, str]] = api_tokens or {}
 
     async def wait_until_red_ready(self) -> None:
         await asyncio.sleep(3600)
@@ -105,6 +111,11 @@ class FakeBot:
 
     async def embed_requested(self, channel, **kwargs) -> bool:
         return self._embed_requested_result
+
+    async def get_shared_api_tokens(self, service_name: str | None = None) -> dict:
+        if service_name is None:
+            return dict(self.api_tokens)
+        return dict(self.api_tokens.get(service_name) or {})
 
 
 def _make_parsed(
@@ -219,7 +230,10 @@ async def test_hybrid_commands_channel_types_and_autocomplete(patched_config) ->
     assert any(c.value == "robrun" for c in all_games)
 
     status_games = await cog._status_game_autocomplete(None, "")  # type: ignore[arg-type]
-    assert {c.value for c in status_games} == {"lol", "tft", "valorant", "eft"}
+    assert {c.value for c in status_games} == {"lol", "tft", "valorant", "eft", "cs2"}
+
+    loc_games = await cog._location_game_autocomplete(None, "")  # type: ignore[arg-type]
+    assert {c.value for c in loc_games} == {"lol", "tft", "valorant", "cs2"}
 
     riot_games = await cog._riot_game_autocomplete(None, "val")  # type: ignore[arg-type]
     assert [c.value for c in riot_games] == ["valorant"]
@@ -946,5 +960,160 @@ async def test_public_defaults_locations_comma_split_role_and_permission_warning
     ok_ch = FakeChannel(701, guild, send_ok=True, embed_ok=True)
     await cog.gw_status.callback(cog, ctx, "lol", ok_ch)  # type: ignore[arg-type]
     assert any("eun1" in m and "!gamewatch region lol" in m for m in msgs)
+
+    await cog.cog_unload()
+
+
+async def test_steam_api_key_status_gating_polling_and_token_update(
+    patched_config, monkeypatch
+) -> None:
+    bot = FakeBot()
+    guild = SimpleNamespace(
+        id=88,
+        name="g88",
+        me=SimpleNamespace(guild_permissions=SimpleNamespace(mention_everyone=True)),
+    )
+    bot.guilds = [guild]
+    cog = module.GameWatch(bot)  # type: ignore[arg-type]
+
+    sent_text: list[str] = []
+    sent_embeds: list[discord.Embed] = []
+
+    class FakeChannel:
+        id = 8801
+        mention = "<#8801>"
+
+        def __init__(self) -> None:
+            self.guild = guild
+
+        def permissions_for(self, member):
+            return SimpleNamespace(
+                view_channel=True,
+                send_messages=True,
+                send_messages_in_threads=True,
+                embed_links=True,
+            )
+
+    class FakeCtx:
+        clean_prefix = "!"
+
+        def __init__(self) -> None:
+            self.guild = guild
+
+        async def embed_requested(self) -> bool:
+            return True
+
+        async def embed_colour(self) -> discord.Colour:
+            return discord.Colour.blue()
+
+        def typing(self):
+            class _Noop:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *exc):
+                    return False
+
+            return _Noop()
+
+        async def send(self, content=None, *, embed=None, **kwargs):
+            if content is not None:
+                sent_text.append(str(content))
+            if embed is not None:
+                sent_embeds.append(embed)
+
+    ctx = FakeCtx()
+    chan = FakeChannel()
+
+    # 1. Without a Steam API key: gw_games marks CS2 under patch notes only,
+    #    gw_status and gw_check guide owner to `[p]set api steam`, and status loop skips cleanly.
+    await cog.gw_games.callback(cog, ctx)  # type: ignore[arg-type]
+    games_fields = {f.name: f.value for f in sent_embeds[-1].fields}
+    assert "cs2" not in (games_fields.get("\U0001f4e1 Status + patch notes") or "")
+    assert "Steam Web API key" in (games_fields.get("\U0001f4f0 Patch notes only") or "")
+
+    sent_text.clear()
+    await cog.gw_status.callback(cog, ctx, "cs2", chan)  # type: ignore[arg-type]
+    assert any("!set api steam api_key" in m for m in sent_text)
+    assert (await cog._guild_game_cfg(guild, "cs2")).get("status_channel") is None  # type: ignore[arg-type]
+
+    sent_text.clear()
+    await cog.gw_check.callback(cog, ctx, "cs2")  # type: ignore[arg-type]
+    assert any("!set api steam api_key" in m for m in sent_text)
+
+    # Even if a guild had cs2 status configured before key removal, status loop skips without error
+    async with cog.config.guild(guild).games() as g:
+        g["cs2"] = {"status_channel": 8801, "region": "global", "enabled": True}
+
+    fetch_calls: list[tuple[str, str | None]] = []
+
+    async def fake_fetch_status(session, game, region, *, validator=None, api_key=None):
+        fetch_calls.append((game, api_key))
+        return (
+            {
+                "region_id": "global",
+                "region_name": "Global",
+                "ok": True,
+                "services": [{"name": "Sessions Logon", "status": 0, "label": "Normal"}],
+                "datacenters": [{"name": "EU North", "region": "EU North", "status": 0}],
+                "items": [],
+                "worst": 0,
+            },
+            {},
+            200,
+        )
+
+    monkeypatch.setattr(module, "fetch_game_status", fake_fetch_status)
+    await cog._check_status_once()
+    assert fetch_calls == []
+    assert cog._failures.get("status-cs2-global", 0) == 0
+
+    sent_text.clear()
+    await cog.gw_diag.callback(cog, ctx)  # type: ignore[arg-type]
+    assert any("no steam api_key" in m and "steam=not set" in m for m in sent_text)
+
+    # Disabling cs2 status still works even without a key
+    sent_text.clear()
+    await cog.gw_status.callback(cog, ctx, "cs2", None)  # type: ignore[arg-type]
+    assert any("disabled" in m.lower() for m in sent_text)
+
+    # 2. Configure Steam API key via Red's shared API tokens -> CS2 unlocks immediately!
+    cog._failures["status-cs2-global"] = 5
+    cog._alerted.add("status-cs2-global")
+    bot.api_tokens["steam"] = {"api_key": "VALID_KEY_XYZ"}
+    await cog.on_red_api_tokens_update("steam", bot.api_tokens["steam"])
+    assert "status-cs2-global" not in cog._failures
+    assert "status-cs2-global" not in cog._alerted
+
+    sent_embeds.clear()
+    await cog.gw_games.callback(cog, ctx)  # type: ignore[arg-type]
+    games_fields = {f.name: f.value for f in sent_embeds[-1].fields}
+    assert "cs2" in (games_fields.get("\U0001f4e1 Status + patch notes") or "")
+
+    sent_text.clear()
+    await cog.gw_status.callback(cog, ctx, "cs2", chan)  # type: ignore[arg-type]
+    assert (await cog._guild_game_cfg(guild, "cs2"))["status_channel"] == 8801  # type: ignore[arg-type]
+
+    # Location allowlist works for CS2 datacenters
+    await cog.gw_locations.callback(cog, ctx, "cs2", "add", location="EU North, Poland")  # type: ignore[arg-type]
+    assert (await cog._guild_game_cfg(guild, "cs2"))["location_allow"] == ["eu north", "poland"]  # type: ignore[arg-type]
+
+    # Status loop now polls CS2 with the Steam key
+    await cog._check_status_once()
+    assert fetch_calls == [("cs2", "VALID_KEY_XYZ")]
+
+    # gw_check succeeds with key and gives a helpful message on HTTP 403 (bad key)
+    sent_embeds.clear()
+    await cog.gw_check.callback(cog, ctx, "cs2")  # type: ignore[arg-type]
+    assert len(sent_embeds) == 1
+    assert "Counter-Strike 2" in (sent_embeds[0].title or "")
+
+    async def fake_403(session, game, region, *, validator=None, api_key=None):
+        return None, {}, 403
+
+    monkeypatch.setattr(module, "fetch_game_status", fake_403)
+    sent_text.clear()
+    await cog.gw_check.callback(cog, ctx, "cs2")  # type: ignore[arg-type]
+    assert any("rejected the configured key" in m and "403" in m for m in sent_text)
 
     await cog.cog_unload()

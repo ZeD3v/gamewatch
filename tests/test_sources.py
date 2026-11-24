@@ -22,11 +22,14 @@ from gamewatch.sources import (
     extract_location,
     fetch_abi_news,
     fetch_abi_news_detail,
+    fetch_cs2_status,
     fetch_eft_status,
+    fetch_game_status,
     fetch_riot_news,
     filter_status_view,
     location_allowed,
     parse_abi_news,
+    parse_cs2_status,
     parse_eft_news,
     parse_eft_status,
     parse_riot_news,
@@ -295,11 +298,23 @@ async def test_request_retries_timeout_and_client_error_then_raises(monkeypatch)
         await _request(s_to_fail, "GET", "https://example.com/t?key=SECRET", retries=1)  # type: ignore[arg-type]
     assert len(s_to_fail.calls) == 2
 
-    # Exhausted ClientError raises FetchError with redacted secret
-    s_ce = _FakeSession([aiohttp.ClientError("reset"), aiohttp.ClientError("reset")])
+    # Exhausted ClientError raises FetchError with redacted secret (both URL & exception body)
+    s_ce = _FakeSession(
+        [
+            aiohttp.ClientError("reset https://api.steampowered.com/x?key=SUPERSECRET999"),
+            aiohttp.ClientError("reset https://api.steampowered.com/x?key=SUPERSECRET999"),
+        ]
+    )
     with pytest.raises(FetchError, match="client error") as exc_info:
-        await _request(s_ce, "GET", "https://example.com/c?token=SECRET", retries=1)  # type: ignore[arg-type]
+        await _request(
+            s_ce,
+            "GET",
+            "https://example.com/c?token=SECRET",
+            params={"key": "SUPERSECRET999"},
+            retries=1,
+        )  # type: ignore[arg-type]
     assert "SECRET" not in str(exc_info.value)
+    assert "SUPERSECRET999" not in str(exc_info.value)
     assert len(s_ce.calls) == 2
 
 
@@ -686,6 +701,117 @@ def test_location_extraction_and_filtering_with_plural_and_scheduled() -> None:
     assert [i["uid"] for i in sched_view["items"]] == ["sched-1"]
     assert sched_view["filtered_count"] == 1
     assert sched_view["ok"] is True
+
+
+def test_parse_cs2_status_healthy_degraded_and_datacenter_location_filter() -> None:
+    healthy_payload = {
+        "result": {
+            "app": {"version": 14078, "timestamp": 1795000000},
+            "services": {"SessionsLogon": "normal", "SteamCommunity": "normal"},
+            "matchmaking": {
+                "scheduler": "normal",
+                "online_servers": 182340,
+                "online_players": 912345,
+                "searching_players": 14200,
+                "search_seconds_avg": 45,
+            },
+            "datacenters": {
+                # Valve's capacity="full" + load="high" is healthy, NOT an outage!
+                "EU North": {"capacity": "full", "load": "high"},
+                "EU West": {"capacity": "full", "load": "medium"},
+                # Low capacity / surge load shows degraded on panel without firing outage alerts
+                "Peru": {"capacity": "low", "load": "surge"},
+            },
+        }
+    }
+    parsed = parse_cs2_status(healthy_payload)
+    assert parsed["ok"] is True
+    assert parsed["worst"] == 0
+    assert parsed["items"] == []
+    assert parsed["matchmaking"]["online_players"] == 912345
+    dc_by_name = {d["name"]: d for d in parsed["datacenters"]}
+    assert dc_by_name["EU North"]["status"] == 0
+    assert dc_by_name["Peru"]["status"] == 2
+    assert "Low capacity" in dc_by_name["Peru"]["label"]
+
+    # Degraded core service + offline datacenter
+    degraded_payload = {
+        "result": {
+            "services": {"SessionsLogon": "delayed", "SteamCommunity": "offline"},
+            "matchmaking": {"scheduler": "normal"},
+            "datacenters": {
+                "EU North": {"capacity": "full", "load": "low"},
+                "Peru": {"capacity": "offline", "load": "offline"},
+            },
+        }
+    }
+    bad = parse_cs2_status(degraded_payload)
+    assert bad["ok"] is False
+    assert bad["worst"] == 3
+    assert len(bad["items"]) == 2
+    svc_inc, dc_inc = bad["items"]
+    assert svc_inc["severity"] == "critical"
+    assert "Steam Community" in svc_inc["title"]
+    assert dc_inc["location"] == "Peru"
+    assert extract_location(dc_inc) == "Peru"
+
+    # Datacenter-only offline outage can be location-filtered cleanly back to ok=True!
+    dc_only = parse_cs2_status(
+        {
+            "result": {
+                "services": {"SessionsLogon": "normal", "SteamCommunity": "normal"},
+                "matchmaking": {"scheduler": "normal"},
+                "datacenters": {
+                    "EU North": {"capacity": "full", "load": "low"},
+                    "Peru": {"capacity": "offline", "load": "offline"},
+                },
+            }
+        }
+    )
+    assert dc_only["ok"] is False
+    assert dc_only["worst"] == 0
+    filtered = filter_status_view(dc_only, ["eu north", "poland"])
+    assert filtered["items"] == []
+    assert filtered["filtered_count"] == 1
+    assert filtered["ok"] is True
+
+    with pytest.raises(FetchError):
+        parse_cs2_status({})
+    with pytest.raises(FetchError):
+        parse_cs2_status({"result": {}})
+
+
+async def test_fetch_cs2_status_passes_key_param_and_validates_key(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_request(session, method, url, **kwargs):
+        calls.append({"method": method, "url": url, **kwargs})
+        return (
+            {
+                "result": {
+                    "services": {"SessionsLogon": "normal", "SteamCommunity": "normal"},
+                    "matchmaking": {"scheduler": "normal"},
+                    "datacenters": {"EU North": {"capacity": "full", "load": "low"}},
+                }
+            },
+            {},
+            200,
+        )
+
+    monkeypatch.setattr(sources, "_request", fake_request)
+    parsed, val, status = await fetch_game_status(
+        object(),  # type: ignore[arg-type]
+        "cs2",
+        "global",
+        api_key="TESTKEY123",
+    )
+    assert status == 200 and val == {}
+    assert parsed is not None and parsed["ok"] is True
+    assert calls[0]["params"] == {"key": "TESTKEY123"}
+    assert "ICSGOServers_730/GetGameServersStatus" in calls[0]["url"]
+
+    with pytest.raises(ValueError, match="Steam Web API key"):
+        await fetch_cs2_status(object(), api_key="")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

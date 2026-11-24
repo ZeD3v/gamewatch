@@ -22,13 +22,14 @@ class StatusItem(TypedDict, total=False):
     maintenance_status: Optional[str]  # "scheduled" | "in_progress" | None
     title: str
     body: str
+    location: Optional[str]  # explicit datacenter/server location when known
     platforms: list[str]
     created_at: Optional[str]
     updated_at: Optional[str]
 
 
 class ParsedStatus(TypedDict, total=False):
-    """Normalised result of any status fetch (Riot or EFT)."""
+    """Normalised result of any status fetch (Riot, EFT, or Steam CS2)."""
 
     ok: bool
     region_id: Optional[str]
@@ -36,6 +37,7 @@ class ParsedStatus(TypedDict, total=False):
     items: list[StatusItem]
     services: list[dict]
     datacenters: list[dict]
+    matchmaking: dict
     global_message: Optional[str]
     worst: int
     # Populated by sources.filter_status_view (location allowlist):

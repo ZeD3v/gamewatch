@@ -787,7 +787,10 @@ def incident_embed(game: str, region: str, parsed: dict, item: dict) -> discord.
     if degraded:
         lines = []
         for svc in degraded[:12]:
-            emoji, label = EFT_STATUS_STYLE.get(svc.get("status") or 0, ("\u26aa", "Unknown"))
+            emoji, fallback_label = EFT_STATUS_STYLE.get(
+                svc.get("status") or 0, ("\u26aa", "Unknown")
+            )
+            label = svc.get("label") or fallback_label
             lines.append(f"{emoji} **{svc.get('name') or 'Service'}** \u2014 {label}")
         embed.add_field(
             name=f"Affected services ({len(degraded)}/{len(services)})",
@@ -799,8 +802,14 @@ def incident_embed(game: str, region: str, parsed: dict, item: dict) -> discord.
     degraded_dcs = [d for d in datacenters if (d.get("status") or 0) > 0]
     if degraded_dcs:
         dc_lines = []
-        for dc in degraded_dcs[:12]:
-            emoji, label = EFT_STATUS_STYLE.get(dc.get("status") or 0, ("\u26aa", "Unknown"))
+        for dc in sorted(
+            degraded_dcs,
+            key=lambda d: (-(d.get("status") or 0), str(d.get("region") or d.get("name") or "")),
+        )[:12]:
+            emoji, fallback_label = EFT_STATUS_STYLE.get(
+                dc.get("status") or 0, ("\u26aa", "Unknown")
+            )
+            label = dc.get("label") or fallback_label
             dc_name = dc.get("region") or dc.get("name") or "Datacenter"
             dc_lines.append(f"{emoji} **{dc_name}** \u2014 {label}")
         embed.add_field(
@@ -885,21 +894,81 @@ def status_panel_embed(game: str, region: str, parsed: dict) -> discord.Embed:
     if services:
         lines = []
         for svc in services[:15]:
-            emoji, _ = EFT_STATUS_STYLE.get(svc.get("status") or 0, ("\u26aa", "Unknown"))
-            lines.append(f"{emoji} {svc.get('name') or 'Service'}")
+            st = svc.get("status") or 0
+            emoji, fallback_label = EFT_STATUS_STYLE.get(st, ("\u26aa", "Unknown"))
+            svc_name = svc.get("name") or "Service"
+            if st > 0:
+                label = svc.get("label") or fallback_label
+                lines.append(f"{emoji} {svc_name} \u2014 {label}")
+            else:
+                lines.append(f"{emoji} {svc_name}")
         embed.add_field(
             name=f"Services ({len(services)})",
             value=_trunc("\n".join(lines), MAX_FIELD_VALUE),
             inline=False,
         )
 
+    mm = parsed.get("matchmaking")
+    if isinstance(mm, dict):
+        mm_parts: list[str] = []
+        if mm.get("online_players"):
+            mm_parts.append(f"**{mm['online_players']:,}** online")
+        if mm.get("searching_players"):
+            search_str = f"**{mm['searching_players']:,}** searching"
+            if mm.get("search_seconds_avg"):
+                search_str += f" (~{mm['search_seconds_avg']}s avg)"
+            mm_parts.append(search_str)
+        if mm.get("online_servers"):
+            mm_parts.append(f"**{mm['online_servers']:,}** servers")
+        if mm_parts:
+            embed.add_field(
+                name="Matchmaking",
+                value=_trunc(" \u2022 ".join(mm_parts), MAX_FIELD_VALUE),
+                inline=False,
+            )
+
     datacenters = parsed.get("datacenters") or []
     if datacenters:
+        sorted_dcs = sorted(
+            datacenters,
+            key=lambda d: (-(d.get("status") or 0), str(d.get("region") or d.get("name") or "")),
+        )
         dc_lines = []
-        for dc in datacenters[:12]:
-            emoji, _ = EFT_STATUS_STYLE.get(dc.get("status") or 0, ("\u26aa", "Unknown"))
-            dc_name = dc.get("region") or dc.get("name") or "Datacenter"
-            dc_lines.append(f"{emoji} {dc_name}")
+        if len(sorted_dcs) <= 12:
+            for dc in sorted_dcs:
+                st = dc.get("status") or 0
+                emoji, fallback_label = EFT_STATUS_STYLE.get(st, ("\u26aa", "Unknown"))
+                dc_name = dc.get("region") or dc.get("name") or "Datacenter"
+                if st > 0:
+                    label = dc.get("label") or fallback_label
+                    dc_lines.append(f"{emoji} {dc_name} \u2014 {label}")
+                else:
+                    dc_lines.append(f"{emoji} {dc_name}")
+        else:
+            degraded_dcs = [d for d in sorted_dcs if (d.get("status") or 0) > 0]
+            ok_dcs = [d for d in sorted_dcs if (d.get("status") or 0) == 0]
+            for dc in degraded_dcs[:10]:
+                st = dc.get("status") or 0
+                emoji, fallback_label = EFT_STATUS_STYLE.get(st, ("\u26aa", "Unknown"))
+                dc_name = dc.get("region") or dc.get("name") or "Datacenter"
+                label = dc.get("label") or fallback_label
+                dc_lines.append(f"{emoji} **{dc_name}** \u2014 {label}")
+            if len(degraded_dcs) > 10:
+                dc_lines.append(f"\u2026 and {len(degraded_dcs) - 10} more degraded")
+            if ok_dcs:
+                if degraded_dcs:
+                    dc_lines.append(f"{RECOVERY_EMOJI} {len(ok_dcs)}/{len(sorted_dcs)} operational")
+                else:
+                    dc_lines.append(
+                        f"{RECOVERY_EMOJI} All {len(sorted_dcs)} datacenters operational"
+                    )
+                    high_load = [
+                        str(d.get("region") or d.get("name"))
+                        for d in ok_dcs
+                        if str(d.get("load") or "").lower() == "high"
+                    ]
+                    if high_load:
+                        dc_lines.append(f"High load: {', '.join(high_load[:8])}")
         embed.add_field(
             name=f"Datacenters ({len(datacenters)})",
             value=_trunc("\n".join(dc_lines), MAX_FIELD_VALUE),

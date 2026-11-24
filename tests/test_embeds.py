@@ -437,3 +437,65 @@ def test_riot_status_url_reflects_configured_region_and_fit_embed_caps_desc() ->
     assert "- First bullet" in bb
     assert "- Second bullet" in bb
     assert "-  " not in bb
+
+
+def test_cs2_status_embeds_render_matchmaking_and_large_datacenter_summary() -> None:
+    dcs = [
+        {"name": f"Region {i:02d}", "region": f"Region {i:02d}", "status": 0, "load": "low"}
+        for i in range(18)
+    ]
+    dcs.append(
+        {
+            "name": "EU North",
+            "region": "EU North",
+            "status": 0,
+            "load": "high",
+            "label": "High load",
+        }
+    )
+    dcs.append(
+        {"name": "Peru", "region": "Peru", "status": 3, "load": "offline", "label": "Offline"}
+    )
+    parsed = {
+        "region_id": "global",
+        "region_name": "Global",
+        "ok": False,
+        "services": [
+            {"name": "Sessions Logon", "status": 2, "label": "Delayed"},
+            {"name": "Steam Community", "status": 0, "label": "Normal"},
+            {"name": "Matchmaking Scheduler", "status": 0, "label": "Normal"},
+        ],
+        "matchmaking": {
+            "scheduler": "normal",
+            "online_players": 912345,
+            "searching_players": 14200,
+            "search_seconds_avg": 45,
+            "online_servers": 182340,
+        },
+        "datacenters": dcs,
+        "items": [
+            {
+                "uid": "cs2-services-SessionsLogon:delayed",
+                "severity": "warning",
+                "title": "Degraded - Sessions Logon",
+                "body": "Sessions Logon: Delayed",
+            }
+        ],
+    }
+
+    panel = status_panel_embed("cs2", "global", parsed)
+    field_map = {f.name: f.value for f in panel.fields}
+    assert "Matchmaking" in field_map
+    assert "912,345" in (field_map["Matchmaking"] or "")
+    assert "~45s avg" in (field_map["Matchmaking"] or "")
+    assert "Delayed" in (field_map["Services (3)"] or "")
+    dc_field = field_map["Datacenters (20)"] or ""
+    assert "Peru" in dc_field and "Offline" in dc_field
+    assert "19/20 operational" in dc_field
+    _assert_discord_limits(panel)
+
+    inc = incident_embed("cs2", "global", parsed, parsed["items"][0])
+    inc_fields = {f.name: f.value for f in inc.fields}
+    assert "Delayed" in (inc_fields["Affected services (1/3)"] or "")
+    assert "Offline" in (inc_fields["Affected datacenters (1/20)"] or "")
+    _assert_discord_limits(inc)

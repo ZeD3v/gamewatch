@@ -7,6 +7,7 @@ every Discord limit is respected.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -117,11 +118,17 @@ async def main():
         print("=" * 70)
         print("STATUS EMBEDS")
         print("=" * 70)
+        steam_api_key = os.environ.get("STEAM_API_KEY", "").strip() or None
         for game, cfg in GAMES.items():
             if not cfg["status_kind"]:
                 continue
+            req_service = cfg.get("requires_api_key")
+            api_key = steam_api_key if req_service == "steam" else None
+            if req_service and not api_key:
+                print(f"  {game}/status{'':24} SKIP (set {req_service.upper()}_API_KEY)")
+                continue
             region = REGIONS.get(game, cfg["default_region"])
-            parsed, _, http = await fetch_game_status(session, game, region)
+            parsed, _, http = await fetch_game_status(session, game, region, api_key=api_key)
             if not parsed:
                 failures.append((game, [f"status http {http}"]))
                 continue

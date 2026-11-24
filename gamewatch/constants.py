@@ -106,6 +106,16 @@ STEAM_PARTNER_EVENTS_URL = "https://store.steampowered.com/events/ajaxgetpartner
 STEAM_EVENT_CANONICAL_URL = "https://store.steampowered.com/news/app/{appid}/view/{gid}"
 STEAM_CLAN_IMAGE_FASTLY = "https://clan.fastly.steamstatic.com/images/"
 
+# Optional keyed Steam Web API status (Counter-Strike 2 / appid 730).
+# Requires a free Steam Web API key via Red's `[p]set api steam api_key,<key>`.
+STEAM_CS2_STATUS_URL = "https://api.steampowered.com/ICSGOServers_730/GetGameServersStatus/v1/"
+CS2_SERVICE_NAMES: dict[str, str] = {
+    "SessionsLogon": "Sessions Logon",
+    "SteamCommunity": "Steam Community",
+    "IEconItems": "Player Inventories",
+    "Leaderboards": "Leaderboards",
+}
+
 # ---------------------------------------------------------------------------
 # Escape from Tarkov (BSG status & official patch-notes JSON APIs)
 # ---------------------------------------------------------------------------
@@ -181,7 +191,8 @@ ICON_TFT = (
 # Game table
 # ---------------------------------------------------------------------------
 # news_kind:   "riot" | "steam_events" | "eft_bsg" | "abi_cms"
-# status_kind: "riot" | "eft" | None   (None = no keyless public status API)
+# status_kind: "riot" | "eft" | "steam_cs2" | None
+# requires_api_key: optional Red shared API token service name (e.g. "steam")
 GAMES = {
     "lol": {
         "name": "League of Legends",
@@ -252,7 +263,9 @@ GAMES = {
         "name": "Counter-Strike 2",
         "emoji": "\U0001f52b",
         "colour": 0xF0A202,
-        "status_kind": None,
+        "status_kind": "steam_cs2",
+        "requires_api_key": "steam",
+        "default_region": "global",
         "news_kind": "steam_events",
         "appid": 730,
         # Exact parity with counter-strike.net/news/updates (event_type == 12).
@@ -266,7 +279,7 @@ GAMES = {
         "icon": STEAM_ICON.format(appid=730, h="8dbc71957312bbd3baea65848b545be9eae2a355"),
         "art": STEAM_HEADER.format(appid=730),
         "source_label": "Steam \u2022 Valve",
-        "status_label": "Status",
+        "status_label": "Steam Web API",
         "uid_prefix": "steam-ev-",
     },
     "eft": {
@@ -377,17 +390,16 @@ GAMES = {
     },
 }
 
-# No-status games (cs2, arc, abi, robrun; status_kind=None above):
-# - cs2: Valve's ICSGOServers_730/GetGameServersStatus/v1 requires a Steam Web
-#   API key (403 keyless), GetSDRConfig is static PoP topology only, and
-#   steamstat.us explicitly forbids third-party scraping + blocks via Cloudflare.
+# No-status games (arc, abi, robrun; status_kind=None above):
 # - arc: status.arcraiders.com / status.embark-studios.com / status.embark.games
-#   are NXDOMAIN; embark.statuspage.io is inactive (401); Embark Help Center
-#   directs players to Discord.
+#   are NXDOMAIN; embark.statuspage.io is inactive (401); no Steam Web API
+#   status interface exists for appid 1808500; Embark directs players to Discord.
 # - abi: status.arenabreakoutinfinite.com / status.levelinfinite.com NXDOMAIN;
-#   zero status endpoints in frontend JS.
+#   zero status endpoints in frontend JS or Steam Web API.
 # - robrun: status.robrun.com / status.kefir.com NXDOMAIN; status.kefirgames.com
-#   has invalid SSL hostname mismatch; robrun/kefir statuspage.io unclaimed.
+#   has invalid SSL hostname mismatch; no Steam Web API status interface.
+# Note: cs2 uses Valve's official ICSGOServers_730/GetGameServersStatus/v1
+# endpoint when a free Steam Web API key is configured via `[p]set api steam`.
 
 USER_AGENT = "Red-DiscordBot GameWatch cog (+https://github.com/ZeD3v/gamewatch)"
 

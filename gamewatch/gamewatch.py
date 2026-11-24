@@ -7,6 +7,7 @@ import io
 import logging
 import re
 import time
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional, Union
 
@@ -50,6 +51,10 @@ log = logging.getLogger("red.zed3v.gamewatch")
 
 TargetChannel = Union[discord.TextChannel, discord.Thread]
 LOCATION_ACTIONS = ("add", "remove", "clear", "reset")
+_LOCATION_FILTER_KINDS = frozenset({"riot", "steam_cs2"})
+_API_KEY_PORTALS: dict[str, tuple[str, str]] = {
+    "steam": ("Steam Web API", "https://steamcommunity.com/dev/apikey"),
+}
 
 
 STATUS_INTERVAL = 90  # seconds
@@ -151,6 +156,46 @@ class GameWatch(commands.Cog):
     ) -> None:
         """GameWatch stores no end user data."""
         return
+
+    @commands.Cog.listener()
+    async def on_red_api_tokens_update(
+        self, service_name: str, api_tokens: Mapping[str, str]
+    ) -> None:
+        """Clear cached health/failure state when a required API key is updated."""
+        service = service_name.lower()
+        for game, cfg in GAMES.items():
+            if cfg.get("requires_api_key") != service:
+                continue
+            prefix = f"status-{game}-"
+            for store in (self._validators, self._failures, self._last_health):
+                for skey in [k for k in store if k.startswith(prefix)]:
+                    store.pop(skey, None)
+            for skey in [k for k in self._alerted if k.startswith(prefix)]:
+                self._alerted.discard(skey)
+
+    async def _get_api_key(self, service: str) -> Optional[str]:
+        """Read a bot-wide API key from Red's shared API tokens (`[p]set api`)."""
+        getter = getattr(self.bot, "get_shared_api_tokens", None)
+        if getter is None:
+            return None
+        tokens = await getter(service)
+        if not isinstance(tokens, Mapping):
+            return None
+        raw = tokens.get("api_key") or tokens.get("key") or ""
+        cleaned = str(raw).strip()
+        return cleaned or None
+
+    @staticmethod
+    def _missing_api_key_message(game: str, prefix: str) -> str:
+        cfg = GAMES[game]
+        service = cfg.get("requires_api_key") or "steam"
+        label, portal = _API_KEY_PORTALS.get(service, (service.title(), ""))
+        portal_note = f" (free at <{portal}>)" if portal else ""
+        return (
+            f"{cfg['name']} status monitoring requires a {label} key{portal_note}.\n"
+            f"The bot owner can set one in DM via `{prefix}set api {service} api_key,<your_key>` "
+            f"(or `{prefix}set api {service}` for a modal). Patch notes work without an API key."
+        )
 
     # ------------------------------------------------------------------
     # helpers
@@ -422,16 +467,28 @@ class GameWatch(commands.Cog):
 
     async def _check_status_inner(self) -> None:
         all_guilds = await self.config.all_guilds()
-        jobs: list[tuple[str, str, list[tuple[discord.Guild, dict]]]] = []
+        api_keys: dict[str, Optional[str]] = {}
+        jobs: list[tuple[str, str, list[tuple[discord.Guild, dict]], Optional[str]]] = []
         for game, cfg in GAMES.items():
             if cfg["status_kind"] is None:
                 continue
             targets = await self._targets(game, "status_channel", all_guilds)
             if not targets:
                 continue
+            req_service = cfg.get("requires_api_key")
+            api_key: Optional[str] = None
+            if req_service:
+                if req_service not in api_keys:
+                    api_keys[req_service] = await self._get_api_key(req_service)
+                api_key = api_keys[req_service]
+                if not api_key:
+                    log.debug(
+                        "Skipping %s status poll: no %s API key configured", game, req_service
+                    )
+                    continue
             regions = sorted({(gcfg.get("region") or cfg["default_region"]) for _, gcfg in targets})
             for region in regions:
-                jobs.append((game, region, targets))
+                jobs.append((game, region, targets, api_key))
 
         if not jobs:
             return
@@ -440,20 +497,21 @@ class GameWatch(commands.Cog):
         sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
         async def _fetch_one(
-            game: str, region: str
+            game: str, region: str, api_key: Optional[str]
         ) -> tuple[Optional[ParsedStatus], CacheValidator, int, int]:
             key = f"status-{game}-{region}"
             validator = dict(self._validators.get(key) or {})
             async with sem:
                 t0 = time.monotonic()
-                parsed, new_val, http = await fetch_game_status(
-                    session, game, region, validator=validator or None
-                )
+                kwargs: dict[str, Any] = {"validator": validator or None}
+                if api_key is not None:
+                    kwargs["api_key"] = api_key
+                parsed, new_val, http = await fetch_game_status(session, game, region, **kwargs)
                 ms = int((time.monotonic() - t0) * 1000)
                 return parsed, new_val, http, ms
 
         results = await asyncio.gather(
-            *(_fetch_one(game, region) for game, region, _ in jobs),
+            *(_fetch_one(game, region, api_key) for game, region, _, api_key in jobs),
             return_exceptions=True,
         )
         # Only propagate fatal non-Exception BaseExceptions (e.g. CancelledError);
@@ -464,7 +522,7 @@ class GameWatch(commands.Cog):
                 raise res
 
         # Phase 2: deterministic sequential state updates and announcements.
-        for (game, region, targets), res in zip(jobs, results, strict=True):
+        for (game, region, targets, _), res in zip(jobs, results, strict=True):
             key = f"status-{game}-{region}"
             if isinstance(res, Exception):
                 if not isinstance(res, FetchError):
@@ -484,7 +542,13 @@ class GameWatch(commands.Cog):
                     await self._process_status(game, region, cached, targets)
                 continue
             if http != 200 or parsed is None:
-                await self._note_failure(key, f"HTTP {http}")
+                req_service = GAMES[game].get("requires_api_key")
+                detail = (
+                    f"HTTP {http} (invalid or revoked {req_service} API key?)"
+                    if req_service and http in (401, 403)
+                    else f"HTTP {http}"
+                )
+                await self._note_failure(key, detail)
                 continue
 
             self._note_success(key)
@@ -780,7 +844,11 @@ class GameWatch(commands.Cog):
     # ------------------------------------------------------------------
     @staticmethod
     def _matching_game_choices(
-        current: str, *, status_only: bool = False, riot_only: bool = False
+        current: str,
+        *,
+        status_only: bool = False,
+        riot_only: bool = False,
+        location_only: bool = False,
     ) -> list[app_commands.Choice[str]]:
         needle = current.lower().strip()
         choices: list[app_commands.Choice[str]] = []
@@ -788,6 +856,8 @@ class GameWatch(commands.Cog):
             if status_only and cfg["status_kind"] is None:
                 continue
             if riot_only and cfg["status_kind"] != "riot":
+                continue
+            if location_only and cfg["status_kind"] not in _LOCATION_FILTER_KINDS:
                 continue
             label = f"{cfg['name']} ({key})"
             if not needle or needle in key or needle in cfg["name"].lower():
@@ -808,6 +878,11 @@ class GameWatch(commands.Cog):
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
         return self._matching_game_choices(current, riot_only=True)
+
+    async def _location_game_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return self._matching_game_choices(current, location_only=True)
 
     async def _region_autocomplete(
         self, interaction: Optional[discord.Interaction], current: str
@@ -857,10 +932,23 @@ class GameWatch(commands.Cog):
     @gamewatch.command(name="games")
     async def gw_games(self, ctx: commands.Context) -> None:
         """List supported games and their keys."""
+        key_cache: dict[str, bool] = {}
         tracked, news_only = [], []
         for key, cfg in GAMES.items():
             line = f"{cfg['emoji']} **{cfg['name']}** \u2014 `{key}`"
-            (tracked if cfg["status_kind"] else news_only).append(line)
+            req_service = cfg.get("requires_api_key")
+            if cfg["status_kind"] is None:
+                news_only.append(line)
+            elif req_service:
+                if req_service not in key_cache:
+                    key_cache[req_service] = bool(await self._get_api_key(req_service))
+                if key_cache[req_service]:
+                    tracked.append(line)
+                else:
+                    label = _API_KEY_PORTALS.get(req_service, (req_service.title(), ""))[0]
+                    news_only.append(f"{line} *(status with {label} key)*")
+            else:
+                tracked.append(line)
         embed = discord.Embed(
             title="Supported games",
             description=(
@@ -883,8 +971,8 @@ class GameWatch(commands.Cog):
             )
         embed.set_footer(
             text=(
-                "CS2, ARC Raiders, Arena Breakout: Infinite, and ROB RUN publish no keyless "
-                "status API, so they are patch notes only."
+                "CS2 status uses an optional Steam Web API key ([p]set api steam). "
+                "ARC Raiders, Arena Breakout: Infinite, and ROB RUN have no public status API."
             )
         )
         await self._send_ctx_embed(ctx, fit_embed(embed))
@@ -918,7 +1006,7 @@ class GameWatch(commands.Cog):
     @gamewatch.command(name="status")
     @commands.admin_or_permissions(manage_guild=True)
     @app_commands.describe(
-        game="Game key with status monitoring (lol, tft, valorant, eft)",
+        game="Game key with status monitoring (lol, tft, valorant, eft, cs2)",
         channel="Channel or thread for status alerts (omit to disable)",
     )
     @app_commands.autocomplete(game=_status_game_autocomplete)
@@ -929,31 +1017,34 @@ class GameWatch(commands.Cog):
         game = game.lower()
         if game not in GAMES:
             return await ctx.send(self._unknown_game_message())
-        if GAMES[game]["status_kind"] is None:
+        cfg = GAMES[game]
+        if cfg["status_kind"] is None:
             return await ctx.send(
-                f"{GAMES[game]['name']} has no public keyless status API, so status monitoring "
+                f"{cfg['name']} has no public status API, so status monitoring "
                 "is not available for it. Patch notes still work."
             )
+        req_service = cfg.get("requires_api_key")
+        if channel is not None and req_service and not await self._get_api_key(req_service):
+            return await ctx.send(self._missing_api_key_message(game, ctx.clean_prefix))
         async with self.config.guild(ctx.guild).games() as games:
             entry = games.setdefault(game, {})
             entry["status_channel"] = channel.id if channel else None
-            entry.setdefault("region", GAMES[game]["default_region"])
+            entry.setdefault("region", cfg["default_region"])
             entry.setdefault("enabled", True)
             active_region = entry["region"]
         if channel:
             warn = self._channel_permission_warning(channel)
             region_hint = ""
-            if GAMES[game]["status_kind"] == "riot":
+            if cfg["status_kind"] == "riot":
                 region_hint = (
                     f" (region: `{active_region}` \u2014 change with "
                     f"`{ctx.clean_prefix}gamewatch region {game} <region>`)"
                 )
             await ctx.send(
-                f"{GAMES[game]['name']} status alerts will post to {channel.mention}"
-                f"{region_hint}.{warn}"
+                f"{cfg['name']} status alerts will post to {channel.mention}{region_hint}.{warn}"
             )
         else:
-            await ctx.send(f"{GAMES[game]['name']} status alerts disabled.")
+            await ctx.send(f"{cfg['name']} status alerts disabled.")
 
     @gamewatch.command(name="role")
     @commands.admin_or_permissions(manage_guild=True)
@@ -1038,11 +1129,13 @@ class GameWatch(commands.Cog):
     @gamewatch.command(name="locations")
     @commands.admin_or_permissions(manage_guild=True)
     @app_commands.describe(
-        game="Riot game key (e.g. valorant)",
+        game="Game key supporting location filtering (lol, tft, valorant, cs2)",
         action="Action: add, remove, clear, or reset (omit to view)",
-        location="Server location(s), comma-separated (e.g. warsaw or warsaw, frankfurt)",
+        location="Server/datacenter location(s), comma-separated (e.g. warsaw, eu north)",
     )
-    @app_commands.autocomplete(game=_riot_game_autocomplete, action=_location_action_autocomplete)
+    @app_commands.autocomplete(
+        game=_location_game_autocomplete, action=_location_action_autocomplete
+    )
     async def gw_locations(
         self,
         ctx: commands.Context,
@@ -1053,8 +1146,11 @@ class GameWatch(commands.Cog):
     ) -> None:
         """Manage the status location allowlist for a game."""
         game = game.lower()
-        if game not in GAMES or GAMES[game]["status_kind"] != "riot":
-            return await ctx.send("Location filtering only applies to Riot status games.")
+        if game not in GAMES or GAMES[game]["status_kind"] not in _LOCATION_FILTER_KINDS:
+            return await ctx.send(
+                "Location filtering applies to Riot status games (`lol`, `tft`, `valorant`) "
+                "and Counter-Strike 2 (`cs2`)."
+            )
         entry = await self._guild_game_cfg(ctx.guild, game)
         current = self._effective_allowlist(entry, game)
         default = DEFAULT_LOCATION_ALLOW.get(game, [])
@@ -1139,15 +1235,22 @@ class GameWatch(commands.Cog):
         """Show the current configuration for this server."""
         games = await self.config.guild(ctx.guild).games()
         severity = await self.config.guild(ctx.guild).ping_severity()
+        key_cache: dict[str, bool] = {}
         lines = []
         for key, cfg in GAMES.items():
             entry = games.get(key) or {}
             news = f"<#{entry['news_channel']}>" if entry.get("news_channel") else "\u2014"
             status = f"<#{entry['status_channel']}>" if entry.get("status_channel") else "\u2014"
+            req_service = cfg.get("requires_api_key")
+            if entry.get("status_channel") and req_service:
+                if req_service not in key_cache:
+                    key_cache[req_service] = bool(await self._get_api_key(req_service))
+                if not key_cache[req_service]:
+                    status += f" *(paused: no `{req_service}` API key)*"
             role = f"<@&{entry['role']}>" if entry.get("role") else "\u2014"
             region = entry.get("region") or cfg.get("default_region") or "\u2014"
             extra = ""
-            if cfg["status_kind"] == "riot":
+            if cfg["status_kind"] in _LOCATION_FILTER_KINDS:
                 allow = self._effective_allowlist(entry, key)
                 extra = (
                     f"\n\u2003locations: {', '.join(allow)}" if allow else "\n\u2003locations: all"
@@ -1169,7 +1272,7 @@ class GameWatch(commands.Cog):
 
     @gamewatch.command(name="check")
     @commands.cooldown(1, 10, commands.BucketType.channel)
-    @app_commands.describe(game="Game key with status monitoring (lol, tft, valorant, eft)")
+    @app_commands.describe(game="Game key with status monitoring (lol, tft, valorant, eft, cs2)")
     @app_commands.autocomplete(game=_status_game_autocomplete)
     async def gw_check(self, ctx: commands.Context, game: str) -> None:
         """Check a game's live status right now."""
@@ -1179,17 +1282,32 @@ class GameWatch(commands.Cog):
         cfg = GAMES[game]
         if cfg["status_kind"] is None:
             return await ctx.send(
-                f"{cfg['name']} publishes no keyless status API. Only patch notes are available."
+                f"{cfg['name']} publishes no public status API. Only patch notes are available."
             )
+        req_service = cfg.get("requires_api_key")
+        api_key: Optional[str] = None
+        if req_service:
+            api_key = await self._get_api_key(req_service)
+            if not api_key:
+                return await ctx.send(self._missing_api_key_message(game, ctx.clean_prefix))
         entry = await self._guild_game_cfg(ctx.guild, game)
         region = entry.get("region") or cfg["default_region"]
         async with ctx.typing():
             session = self._get_session()
             try:
-                parsed, _, http = await fetch_game_status(session, game, region)
+                kwargs: dict[str, Any] = {}
+                if api_key is not None:
+                    kwargs["api_key"] = api_key
+                parsed, _, http = await fetch_game_status(session, game, region, **kwargs)
             except FetchError as exc:
                 return await ctx.send(f"Fetch failed: {exc}")
         if http != 200 or parsed is None:
+            if req_service and http in (401, 403):
+                label = _API_KEY_PORTALS.get(req_service, (req_service.title(), ""))[0]
+                return await ctx.send(
+                    f"{label} rejected the configured key (HTTP {http}). "
+                    f"The bot owner should verify `{ctx.clean_prefix}set api {req_service}`."
+                )
             return await ctx.send(f"Upstream returned HTTP {http}.")
 
         allow = self._effective_allowlist(entry, game)
@@ -1242,6 +1360,11 @@ class GameWatch(commands.Cog):
     async def gw_diag(self, ctx: commands.Context) -> None:
         """Show fetch health for every source."""
         all_guilds = await self.config.all_guilds()
+        api_key_state: dict[str, bool] = {}
+        for cfg in GAMES.values():
+            req_service = cfg.get("requires_api_key")
+            if req_service and req_service not in api_key_state:
+                api_key_state[req_service] = bool(await self._get_api_key(req_service))
         lines = []
         for game, cfg in GAMES.items():
             nkey = f"news-{game}"
@@ -1252,6 +1375,7 @@ class GameWatch(commands.Cog):
                 f"failures={self._failures.get(nkey, 0)}{nstat}"
             )
             if cfg["status_kind"]:
+                req_service = cfg.get("requires_api_key")
                 regions = {
                     (gcfg.get("region") or cfg["default_region"])
                     for data in all_guilds.values()
@@ -1262,6 +1386,9 @@ class GameWatch(commands.Cog):
                     regions = {cfg["default_region"]}
                 for region in sorted(regions):
                     skey = f"status-{game}-{region}"
+                    if req_service and not api_key_state.get(req_service):
+                        lines.append(f"{skey:20} skipped (no {req_service} api_key configured)")
+                        continue
                     shealth = self._last_health.get(skey)
                     sstat = f" http={shealth['http']} {shealth['ms']}ms" if shealth else ""
                     lines.append(
@@ -1272,6 +1399,12 @@ class GameWatch(commands.Cog):
         seen = await self.config.seen()
         boot = await self.config.bootstrapped()
         lines.append("")
+        if api_key_state:
+            key_summary = ", ".join(
+                f"{svc}={'configured' if ok else 'not set'}"
+                for svc, ok in sorted(api_key_state.items())
+            )
+            lines.append(f"api keys: {key_summary}")
         lines.append(f"validators cached: {len(self._validators)}")
         lines.append(f"seen uids: {sum(len(v) for v in seen.values())}")
         lines.append(f"bootstrapped: {sorted(k for k, v in boot.items() if v)}")

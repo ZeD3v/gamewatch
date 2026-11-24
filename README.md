@@ -7,13 +7,13 @@ Per-game server status and patch notes cog for [Red-DiscordBot](https://github.c
 | League of Legends | `lol` | Riot CDN (`eun1` default) | Riot PCS v2.0 JSON (`en-us`, `tags/patch-notes`) + HTML fallback |
 | Teamfight Tactics | `tft` | Riot CDN (`eun1` default) | Riot PCS v2.0 JSON (`en-us`, `tags/patch-notes`) + HTML fallback |
 | VALORANT | `valorant` | Riot CDN (`eu` default) | Riot PCS v2.0 JSON (`en-us`, `tags/patch-notes`) + HTML fallback |
-| Counter-Strike 2 | `cs2` | — | Steam Partner Events (appid `730`) |
+| Counter-Strike 2 | `cs2` | Steam Web API *(optional Steam API key)* | Steam Partner Events (appid `730`) |
 | Escape from Tarkov | `eft` | BSG status API (services + datacenters + global + messages) | BSG official patch-notes JSON API (`escapefromtarkov.com`) |
 | ARC Raiders | `arc` | — | Steam Partner Events (appid `1808500`) |
 | Arena Breakout: Infinite | `abi` | — | Level Infinite GPTS CMS JSON API (`arenabreakoutinfinite.com`) |
 | ROB RUN | `robrun` | — | Steam Partner Events (appid `4262460`) |
 
-No API keys and no extra `pip` dependencies are required.
+No extra `pip` dependencies are required, and no API keys are required for patch notes or Riot/EFT status. Counter-Strike 2 server status is optionally unlocked with a free Steam Web API key via Red's `[p]set api`.
 
 ## Installation
 
@@ -69,6 +69,16 @@ Test immediately without waiting for the next polling cycle:
 
 Riot status feeds require a region ID and default to **`eun1`** (EUNE) for LoL/TFT and **`eu`** for VALORANT. Change per server with `[p]gamewatch region <game> <region>` — the command offers per-game region autocomplete, catches retired shards (`ph2`/`th2` → `sg2`), and validates live against Riot before saving. Status embeds link directly to your configured region on `status.riotgames.com`.
 
+### Optional: Steam Web API Key (CS2 Status)
+
+Patch notes for CS2 work without any key. To also enable live Counter-Strike 2 server status (`[p]gamewatch status cs2` and `[p]gamewatch check cs2`), the bot owner can register a free key at [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey) and store it with Red's built-in shared API tokens (**run in DM with the bot** or use `[p]set api steam` for a private modal):
+
+```text
+[p]set api steam api_key,<your_steam_web_api_key>
+```
+
+Once configured, CS2 status monitors Valve's core services (`SessionsLogon`, `SteamCommunity`, `Matchmaking Scheduler`), live matchmaking metrics, and global datacenters immediately — no cog reload required. Keys are never logged or exposed in error messages.
+
 ### Discord Permissions
 
 In each configured channel or thread, grant the bot:
@@ -93,9 +103,9 @@ All commands are server-only and hybrid — they work as `[p]gamewatch ...`, `[p
 | `[p]gamewatch status <game> [channel]` | Admin / Manage Server | Set the status-alerts channel or thread (omit channel to disable) |
 | `[p]gamewatch role <game> [role]` | Admin / Manage Server | Set the role pinged for that game (omit role to clear) |
 | `[p]gamewatch region <game> <region>` | Admin / Manage Server | Set the Riot region (`lol`, `tft`, `valorant`; validated live) |
-| `[p]gamewatch locations <game> [add\|remove\|clear\|reset] [location]` | Admin / Manage Server | Manage the opt-in Riot status location allowlist |
+| `[p]gamewatch locations <game> [add\|remove\|clear\|reset] [location]` | Admin / Manage Server | Manage the opt-in status location allowlist (`lol`, `tft`, `valorant`, `cs2`) |
 | `[p]gamewatch pingseverity <info\|warning\|critical>` | Admin / Manage Server | Minimum status incident severity that pings the role (default: `warning`) |
-| `[p]gamewatch diag` | Bot Owner | Show fetch health, HTTP status, latency, and validator cache per source |
+| `[p]gamewatch diag` | Bot Owner | Show fetch health, HTTP status, latency, API key status, and validator cache |
 | `[p]gamewatch forcecheck` | Bot Owner | Run both status and news loops immediately |
 | `[p]gamewatch resetseen <game>` | Bot Owner | Clear dedupe & status state for a game (news silently re-seeds on next poll) |
 
@@ -133,14 +143,17 @@ Notes:
 - **End-User Data**: GameWatch does not persistently store any user data or
   metadata. It stores only per-guild channel, role, region, and location
   allowlist configuration plus global feed dedupe state via Red's `Config`.
-- **External Requests**: The cog makes unauthenticated requests to public game
-  endpoints only (no API keys required, and no Discord user or server data is
-  transmitted externally):
+- **External Requests**: The cog makes requests to official public game
+  endpoints only (no Discord user or server data is transmitted externally;
+  only the optional CS2 status endpoint uses the bot owner's Steam Web API
+  key from Red's `[p]set api`):
   - `GET` to Riot CDN status (`*.secure.dyn.riotcdn.net`), Riot Publishing
     Content Service (`content.publishing.riotgames.com`), and Riot news HTML
     fallback (`leagueoflegends.com`, `teamfighttactics.leagueoflegends.com`,
     `playvalorant.com`).
-  - `GET` to Steam Store Partner Events (`store.steampowered.com/events/ajaxgetpartnereventspageable/`).
+  - `GET` to Steam Store Partner Events (`store.steampowered.com/events/ajaxgetpartnereventspageable/`)
+    and, when a Steam Web API key is configured, Valve's CS2 status endpoint
+    (`api.steampowered.com/ICSGOServers_730/GetGameServersStatus/v1/`).
   - `GET` to Battlestate Games' public status API (`status.escapefromtarkov.com/api/*`)
     and official patch-notes API (`www.escapefromtarkov.com/site/api/v1/news-list/2/en`).
   - `POST` (read-only JSON query) to Level Infinite's public GPTS CMS API
@@ -153,17 +166,20 @@ Notes:
 Riot's VALORANT `eu` deployment covers all of EMEA and reports individual
 game-server incidents for locations such as Dubai, Bahrain, Cape Town, and
 Tokyo alongside European servers (London, Paris, Frankfurt, Madrid, Warsaw,
-Stockholm, Istanbul).
+Stockholm, Istanbul). Counter-Strike 2's status feed likewise reports ~30
+global datacenters (`EU North`, `EU West`, `Poland`, `US Northeast`, `Peru`,
+etc.).
 
 Location filtering is **disabled by default** so servers in every region
 receive all status alerts out of the box. If you only care about nearby
-servers, add an allowlist — incidents naming a game-server location outside
-your allowlist are suppressed, while incidents with no specific location
-always announce (fail-open).
+servers or datacenters, add an allowlist — incidents naming a location outside
+your allowlist are suppressed, while region-wide/core-service incidents with
+no specific location always announce (fail-open).
 
 ```text
 [p]gamewatch locations valorant
 [p]gamewatch locations valorant add warsaw, stockholm, frankfurt, london, paris
+[p]gamewatch locations cs2 add eu north, eu east, eu west, poland
 [p]gamewatch locations valorant add madrid
 [p]gamewatch locations valorant remove paris
 [p]gamewatch locations valorant clear
@@ -255,11 +271,21 @@ with full HTML inline. (`api.tarkov.dev/graphql` returns HTTP 422.)
 fetches for unseen items only — MoreFun Studios stopped cross-posting routine
 Live Updates to Steam after July 2026.
 
-**No keyless status API exists for CS2, ARC Raiders, Arena Breakout: Infinite,
-or ROB RUN.** Valve's `ICSGOServers_730/GetGameServersStatus/v1` requires a
-Steam Web API key (403 keyless), `GetSDRConfig` is static PoP topology only, and
-`steamstat.us` explicitly forbids third-party scraping. ARC, ABI, and ROB RUN
-have no official status hosts/APIs.
+**Counter-Strike 2 status (optional Steam Web API key)** uses Valve's official
+`ICSGOServers_730/GetGameServersStatus/v1/` endpoint (configured via Red's
+`[p]set api steam api_key,<key>`). Valve's `capacity: "full"` means full
+provisioned capacity is online and healthy (not overloaded), and normal traffic
+loads (`idle`/`low`/`medium`/`high`) are healthy too. Alerts fire on degraded
+or offline core services (`SessionsLogon`, `SteamCommunity`,
+`Matchmaking Scheduler`) and offline datacenters (which support per-guild
+location filtering via `[p]gamewatch locations cs2`), while peak-hour capacity
+or load dips surface on `[p]gamewatch check cs2` alongside live matchmaking
+stats without spamming channels.
+
+**No public status API exists for ARC Raiders, Arena Breakout: Infinite, or
+ROB RUN.** Embark, MoreFun Studios, and Kefir publish no official status hosts
+or Steam Web API status interfaces (`GetSDRConfig` is static PoP topology only,
+and `steamstat.us` explicitly forbids third-party scraping).
 
 ## Development & Tests
 
@@ -272,11 +298,13 @@ uv run ruff format --check .
 uv run pytest -v
 ```
 
-Live upstream smoke tests (hit Riot, Steam, BSG, and Level Infinite directly):
+Live upstream smoke tests (hit Riot, Steam, BSG, and Level Infinite directly;
+optionally set `STEAM_API_KEY` to also test keyed CS2 status):
 
 ```bash
 uv run python scripts/selftest.py      # also works with aiohttp alone (no redbot/discord.py)
 uv run python scripts/rendertest.py
+STEAM_API_KEY=... uv run python scripts/selftest.py
 ```
 
 - `tests/` — offline pytest suite validating Red Downloader `info.json` schemas,

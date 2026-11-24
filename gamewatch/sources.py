@@ -28,6 +28,7 @@ from .constants import (
     ABI_CMS_LIST_URL,
     ABI_CMS_PRIMARY_LABEL,
     ABI_CMS_SECONDARY_LABEL,
+    CS2_SERVICE_NAMES,
     EFT_DATACENTERS_URL,
     EFT_GLOBAL_DEFAULT_TEXT,
     EFT_GLOBAL_URL,
@@ -43,6 +44,7 @@ from .constants import (
     RIOT_SEVERITY_ORDER,
     RIOT_STATUS_URL,
     STEAM_CLAN_IMAGE_FASTLY,
+    STEAM_CS2_STATUS_URL,
     STEAM_EVENT_CANONICAL_URL,
     STEAM_NEWS_URL,
     STEAM_PARTNER_EVENTS_URL,
@@ -56,6 +58,9 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MiB hard cap per HTTP response
 MAX_RETRY_AFTER = 10.0  # seconds; longer Retry-After defers to the next poll
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 _SECRET_QUERY_KEYS = frozenset({"key", "api_key", "apikey", "token", "access_token", "auth"})
+_SECRET_QUERY_RE = re.compile(
+    r"(?i)([?&](?:key|api_key|apikey|token|access_token|auth)=)([^&\s'\"<>)]+)"
+)
 
 NEXT_DATA_RE = re.compile(
     r'<script id="__NEXT_DATA__" type="application/json"[^>]*>(.*?)</script>', re.S
@@ -129,6 +134,15 @@ def _redact_url(url: str) -> str:
     pairs = parse_qsl(parts.query, keep_blank_values=True)
     redacted = [(k, "REDACTED" if k.lower() in _SECRET_QUERY_KEYS else v) for k, v in pairs]
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(redacted), parts.fragment))
+
+
+def _redact_text(text: str, secrets: Sequence[str] = ()) -> str:
+    """Mask secret query values and explicit tokens inside error strings."""
+    out = _SECRET_QUERY_RE.sub(r"\1REDACTED", text)
+    for secret in secrets:
+        if secret:
+            out = out.replace(secret, "REDACTED")
+    return out
 
 
 def _parse_retry_after(header: Optional[str], *, now: Optional[datetime] = None) -> Optional[float]:
@@ -224,6 +238,11 @@ async def _request(
     - Never retries 304, 4xx (except 429), malformed JSON/UTF-8, or oversized bodies.
     """
     safe_url = _redact_url(url)
+    secret_values: list[str] = []
+    if params:
+        for k, v in params.items():
+            if k.lower() in _SECRET_QUERY_KEYS and v is not None and str(v):
+                secret_values.append(str(v))
     preserved: CacheValidator = dict(validator) if validator else {}
     req_headers: dict[str, str] = {"User-Agent": USER_AGENT}
     if headers:
@@ -282,7 +301,8 @@ async def _request(
                         LookupError,
                         ValueError,
                     ) as exc:
-                        raise FetchError(f"malformed response from {safe_url}: {exc}") from exc
+                        detail = _redact_text(str(exc), secret_values)
+                        raise FetchError(f"malformed response from {safe_url}: {detail}") from exc
         except asyncio.TimeoutError as exc:
             if attempt + 1 < attempts:
                 retry_delay = 0.5 * (2**attempt) + random.uniform(0.0, 0.25)
@@ -292,7 +312,8 @@ async def _request(
             if attempt + 1 < attempts:
                 retry_delay = 0.5 * (2**attempt) + random.uniform(0.0, 0.25)
             else:
-                raise FetchError(f"client error fetching {safe_url}: {exc}") from exc
+                detail = _redact_text(str(exc), secret_values)
+                raise FetchError(f"client error fetching {safe_url}: {detail}") from exc
 
         if retry_delay is not None:
             await asyncio.sleep(retry_delay)
@@ -647,12 +668,212 @@ async def fetch_eft_status(
     )
 
 
+# ---------------------------------------------------------------------------
+# Counter-Strike 2 status (Steam Web API - ICSGOServers_730, optional API key)
+# ---------------------------------------------------------------------------
+_CS2_OK_VALUES = frozenset({"normal", "idle", "low", "medium", "high", "ok"})
+_CS2_DOWN_VALUES = frozenset({"offline", "critical", "down", "unavailable", "no session"})
+_CS2_DC_CAP_OK = frozenset({"", "full", "normal", "high", "medium"})
+_CS2_DC_LOAD_OK = frozenset({"", "idle", "low", "medium", "high", "normal"})
+
+
+def _classify_cs2_service(raw_value: Any) -> tuple[int, str, str]:
+    """Map a Valve CS2 service/scheduler status string to (status_int, label, raw_lower)."""
+    raw = str(raw_value or "").strip().lower()
+    if not raw:
+        return 0, "OK", ""
+    if raw in _CS2_OK_VALUES:
+        return 0, raw.title(), raw
+    if raw in _CS2_DOWN_VALUES:
+        return 3, raw.title(), raw
+    return 2, raw.title(), raw
+
+
+def _classify_cs2_datacenter(info: dict) -> tuple[int, str]:
+    """Map Valve CS2 datacenter capacity/load to (status_int, human label).
+
+    Valve's `capacity: "full"` means full provisioned capacity is online and
+    healthy (NOT overloaded). Normal traffic loads (`idle`/`low`/`medium`/`high`)
+    are healthy too. Only `"offline"`/`"critical"` triggers outage incidents;
+    `"low"` capacity or `"surge"`/`"full"` load renders as degraded on panel.
+    """
+    cap = str(info.get("capacity") or "").strip().lower()
+    load = str(info.get("load") or "").strip().lower()
+
+    if cap in _CS2_DOWN_VALUES or load in _CS2_DOWN_VALUES:
+        down_word = cap if cap in _CS2_DOWN_VALUES else load
+        return 3, down_word.title()
+
+    reasons: list[str] = []
+    if cap not in _CS2_DC_CAP_OK:
+        reasons.append(f"{cap.title()} capacity")
+    if load not in _CS2_DC_LOAD_OK:
+        reasons.append(f"{load.title()} load")
+    if reasons:
+        return 2, ", ".join(reasons)
+
+    return 0, (f"{load.title()} load" if load else "OK")
+
+
+def parse_cs2_status(payload: dict) -> ParsedStatus:
+    """Normalise an ICSGOServers_730/GetGameServersStatus/v1 payload."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+        raise FetchError("CS2 status payload missing 'result' object")
+
+    result = payload["result"]
+    raw_services = result.get("services") if isinstance(result.get("services"), dict) else {}
+    raw_mm = result.get("matchmaking") if isinstance(result.get("matchmaking"), dict) else {}
+    raw_dcs = result.get("datacenters") if isinstance(result.get("datacenters"), dict) else {}
+
+    if not raw_services and not raw_mm:
+        raise FetchError("CS2 status payload missing both 'services' and 'matchmaking'")
+
+    parsed_services: list[dict] = []
+    for key, val in raw_services.items():
+        if not isinstance(val, str):
+            continue
+        st, label, raw_l = _classify_cs2_service(val)
+        parsed_services.append(
+            {
+                "key": str(key),
+                "name": CS2_SERVICE_NAMES.get(str(key), str(key)),
+                "status": st,
+                "label": label,
+                "raw": raw_l,
+            }
+        )
+
+    scheduler = raw_mm.get("scheduler")
+    if isinstance(scheduler, str) and scheduler.strip():
+        st, label, raw_l = _classify_cs2_service(scheduler)
+        parsed_services.append(
+            {
+                "key": "scheduler",
+                "name": "Matchmaking Scheduler",
+                "status": st,
+                "label": label,
+                "raw": raw_l,
+            }
+        )
+
+    parsed_dcs: list[dict] = []
+    for dc_name, dc_info in raw_dcs.items():
+        if not isinstance(dc_info, dict):
+            continue
+        dc_status, dc_label = _classify_cs2_datacenter(dc_info)
+        parsed_dcs.append(
+            {
+                "name": str(dc_name),
+                "region": str(dc_name),
+                "status": dc_status,
+                "label": dc_label,
+                "capacity": str(dc_info.get("capacity") or "").strip().lower(),
+                "load": str(dc_info.get("load") or "").strip().lower(),
+            }
+        )
+    parsed_dcs.sort(key=lambda d: d["name"])
+
+    matchmaking: dict[str, Any] = {}
+    if raw_mm:
+        if isinstance(scheduler, str) and scheduler.strip():
+            matchmaking["scheduler"] = scheduler.strip().lower()
+        for field in (
+            "online_servers",
+            "online_players",
+            "searching_players",
+            "search_seconds_avg",
+        ):
+            val = _safe_int(raw_mm.get(field), -1)
+            if val >= 0:
+                matchmaking[field] = val
+
+    degraded_svcs = [s for s in parsed_services if s["status"] > 0]
+    worst_svc = max((s["status"] for s in degraded_svcs), default=0)
+    offline_dcs = [d for d in parsed_dcs if d["status"] >= 3]
+
+    items: list[StatusItem] = []
+    if degraded_svcs:
+        uid_parts = [f"{s['key']}:{s['raw']}" for s in degraded_svcs]
+        severity = "critical" if worst_svc >= 3 else "warning"
+        headline_prefix = "Down" if worst_svc >= 3 else "Degraded"
+        items.append(
+            {
+                "uid": "cs2-services-" + ",".join(uid_parts),
+                "kind": "incidents",
+                "id": "services",
+                "severity": severity,
+                "maintenance_status": None,
+                "title": f"{headline_prefix} - " + ", ".join(s["name"] for s in degraded_svcs[:6]),
+                "body": "\n".join(f"{s['name']}: {s['label']}" for s in degraded_svcs),
+                "platforms": [],
+                "created_at": None,
+                "updated_at": None,
+            }
+        )
+
+    for dc in offline_dcs:
+        items.append(
+            {
+                "uid": f"cs2-dc-{dc['name'].lower()}-{dc['status']}",
+                "kind": "incidents",
+                "id": dc["name"],
+                "severity": "warning",
+                "maintenance_status": None,
+                "location": dc["name"],
+                "title": f"Datacenter {dc['label']} - {dc['name']}",
+                "body": (
+                    f"CS2 datacenter **{dc['name']}** is currently reporting {dc['label'].lower()}."
+                ),
+                "platforms": [],
+                "created_at": None,
+                "updated_at": None,
+            }
+        )
+
+    out: ParsedStatus = {
+        "region_id": "global",
+        "region_name": "Global",
+        "services": parsed_services,
+        "datacenters": parsed_dcs,
+        # Keep `worst` scoped to core services so location-filtering a single
+        # offline datacenter still flips `ok` cleanly back to True.
+        "worst": worst_svc,
+        "items": items,
+        "ok": worst_svc == 0 and not items,
+    }
+    if matchmaking:
+        out["matchmaking"] = matchmaking
+    return out
+
+
+async def fetch_cs2_status(
+    session: aiohttp.ClientSession,
+    *,
+    api_key: str,
+    validator: Optional[CacheValidator] = None,
+) -> tuple[Optional[ParsedStatus], CacheValidator, int]:
+    """Fetch CS2 server status via Valve's keyed ICSGOServers_730 Web API."""
+    if not api_key or not api_key.strip():
+        raise ValueError("Steam Web API key is required for CS2 status")
+    payload, new_val, status = await _request(
+        session,
+        "GET",
+        STEAM_CS2_STATUS_URL,
+        params={"key": api_key.strip()},
+        validator=None,
+    )
+    if payload is None:
+        return None, new_val, status
+    return parse_cs2_status(payload), {}, status
+
+
 async def fetch_game_status(
     session: aiohttp.ClientSession,
     game: str,
     region: str,
     *,
     validator: Optional[CacheValidator] = None,
+    api_key: Optional[str] = None,
 ) -> tuple[Optional[ParsedStatus], CacheValidator, int]:
     """Unified status dispatcher for all status-monitored games."""
     cfg = GAMES[game]
@@ -661,6 +882,8 @@ async def fetch_game_status(
         return await fetch_riot_status(session, game, region, validator=validator)
     if kind == "eft":
         return await fetch_eft_status(session, validator=validator)
+    if kind == "steam_cs2":
+        return await fetch_cs2_status(session, api_key=api_key or "", validator=validator)
     raise ValueError(f"Game {game!r} has no configured status source")
 
 
@@ -1294,7 +1517,10 @@ LOCATION_RE = re.compile(
 
 
 def extract_location(item: StatusItem) -> Optional[str]:
-    """Pull the affected server location out of an incident, if present."""
+    """Pull the affected server/datacenter location out of an incident, if present."""
+    explicit = item.get("location")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
     for text in (item.get("body") or "", item.get("title") or ""):
         m = LOCATION_RE.search(text)
         if m:

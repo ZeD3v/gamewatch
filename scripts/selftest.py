@@ -10,6 +10,7 @@ Exits non-zero if any source fails.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -31,17 +32,25 @@ REGIONS = {"lol": "eun1", "tft": "eun1", "valorant": "eu"}
 
 async def main() -> int:
     failures = []
+    steam_api_key = os.environ.get("STEAM_API_KEY", "").strip() or None
     async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
         print("=" * 70)
         print("STATUS SOURCES")
         print("=" * 70)
         for game, cfg in GAMES.items():
             if cfg["status_kind"] is None:
-                print(f"  {game:9} SKIP (no keyless public status API)")
+                print(f"  {game:9} SKIP (no public status API)")
+                continue
+            req_service = cfg.get("requires_api_key")
+            api_key = steam_api_key if req_service == "steam" else None
+            if req_service and not api_key:
+                print(f"  {game:9} SKIP (set {req_service.upper()}_API_KEY to test keyed status)")
                 continue
             region = REGIONS.get(game, cfg["default_region"])
             try:
-                parsed, validator, http = await fetch_game_status(session, game, region)
+                parsed, validator, http = await fetch_game_status(
+                    session, game, region, api_key=api_key
+                )
                 if http != 200 or parsed is None:
                     failures.append(f"status {game} HTTP {http}")
                     print(f"  {game:9} FAIL http={http}")

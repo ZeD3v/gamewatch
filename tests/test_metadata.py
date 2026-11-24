@@ -21,6 +21,7 @@ from gamewatch.constants import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COG_DIR = REPO_ROOT / "gamewatch"
 VALID_NEWS_KINDS = {"riot", "steam_events", "eft_bsg", "abi_cms"}
+VALID_STATUS_KINDS = {None, "riot", "eft", "steam_cs2"}
 
 
 def test_repo_info_json_valid(caplog) -> None:
@@ -63,10 +64,14 @@ def test_all_game_configs_and_regex_filters_valid() -> None:
     assert "robrun" in GAMES
     assert GAMES["robrun"]["appid"] == 4262460
     assert GAMES["robrun"]["status_kind"] is None
+    assert GAMES["cs2"]["status_kind"] == "steam_cs2"
+    assert GAMES["cs2"]["requires_api_key"] == "steam"
+    assert GAMES["cs2"]["default_region"] == "global"
 
     for key, cfg in GAMES.items():
         assert cfg.get("uid_prefix"), f"{key} missing uid_prefix"
         assert cfg.get("news_kind") in VALID_NEWS_KINDS, f"{key} invalid news_kind"
+        assert cfg.get("status_kind") in VALID_STATUS_KINDS, f"{key} invalid status_kind"
         for field in ("title_filter", "exclude_filter", "store_update_patch_filter"):
             pattern = cfg.get(field)
             if pattern:

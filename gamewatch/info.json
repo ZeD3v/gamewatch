@@ -6,7 +6,7 @@
     "description": "Per-game server status and patch note announcements for League of Legends, Teamfight Tactics, VALORANT, Counter-Strike 2, Escape from Tarkov, ARC Raiders, Arena Breakout: Infinite, and ROB RUN. Posts to dedicated per-game channels with optional role pings.",
     "short": "Game status and patch notes in per-game channels.",
     "end_user_data_statement": "This cog does not persistently store any data or metadata about users. It stores per-guild channel, role, region, and location allowlist configuration plus global feed dedupe state only.",
-    "install_msg": "Thanks for installing GameWatch!\n\nSet up per-game channels:\n`[p]gamewatch news lol #lol-patch-notes`\n`[p]gamewatch status lol #lol-status`\n`[p]gamewatch games` lists every supported key (alias: `[p]gw`).\n\nLoL/TFT default to `eun1` and VALORANT defaults to `eu`; change with `[p]gamewatch region <game> <region>`.\nTo enable slash commands, run `[p]slash enablecog gamewatch` followed by `[p]slash sync`.\nTest immediately with `[p]gamewatch latest <game>` or `[p]gamewatch check <game>`.",
+    "install_msg": "Thanks for installing GameWatch!\n\nSet up per-game channels:\n`[p]gamewatch news lol #lol-patch-notes`\n`[p]gamewatch status lol #lol-status`\n`[p]gamewatch games` lists every supported key (alias: `[p]gw`).\n\nLoL/TFT default to `eun1` and VALORANT defaults to `eu`; change with `[p]gamewatch region <game> <region>`.\nOptional CS2 status: set a free Steam Web API key in DM with `[p]set api steam api_key,<key>`.\nTo enable slash commands, run `[p]slash enablecog gamewatch` followed by `[p]slash sync`.\nTest immediately with `[p]gamewatch latest <game>` or `[p]gamewatch check <game>`.",
     "min_bot_version": "3.5.0",
     "min_python_version": [
         3,
