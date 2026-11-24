@@ -1,19 +1,19 @@
 # GameWatch
 
-Per-game server status and patch notes cog for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot) (V3.5+), posted to dedicated per-game channels.
+Per-game server status and patch notes cog for [Red-DiscordBot](https://github.com/Cog-Creators/Red-DiscordBot) (V3.5+, Python 3.10+), posted to dedicated per-game channels.
 
 | Game | Key | Status | Patch notes |
 |---|---|---|---|
-| League of Legends | `lol` | Riot CDN (EUNE default) | Riot PCS v2.0 JSON (`en-us`) + `leagueoflegends.com` fallback |
-| Teamfight Tactics | `tft` | Riot CDN (EUNE default) | Riot PCS v2.0 JSON (`tags/patch-notes`) + fallback |
-| VALORANT | `valorant` | Riot CDN (EU default) | Riot PCS v2.0 JSON (`tags/patch-notes`) + fallback |
-| Counter-Strike 2 | `cs2` | — | Steam Partner Events (appid 730) |
+| League of Legends | `lol` | Riot CDN (`eun1` default) | Riot PCS v2.0 JSON (`en-us`, `tags/patch-notes`) + HTML fallback |
+| Teamfight Tactics | `tft` | Riot CDN (`eun1` default) | Riot PCS v2.0 JSON (`en-us`, `tags/patch-notes`) + HTML fallback |
+| VALORANT | `valorant` | Riot CDN (`eu` default) | Riot PCS v2.0 JSON (`en-us`, `tags/patch-notes`) + HTML fallback |
+| Counter-Strike 2 | `cs2` | — | Steam Partner Events (appid `730`) |
 | Escape from Tarkov | `eft` | BSG status API (services + datacenters + global + messages) | BSG official patch-notes JSON API (`escapefromtarkov.com`) |
-| ARC Raiders | `arc` | — | Steam Partner Events (appid 1808500) |
-| Arena Breakout: Infinite | `abi` | — | Official Level Infinite GPTS CMS JSON API (`arenabreakoutinfinite.com`) |
-| ROB RUN | `robrun` | — | Steam Partner Events (appid 4262460) |
+| ARC Raiders | `arc` | — | Steam Partner Events (appid `1808500`) |
+| Arena Breakout: Infinite | `abi` | — | Level Infinite GPTS CMS JSON API (`arenabreakoutinfinite.com`) |
+| ROB RUN | `robrun` | — | Steam Partner Events (appid `4262460`) |
 
-No API keys are required for any source.
+No API keys and no extra `pip` dependencies are required.
 
 ## Installation
 
@@ -26,47 +26,82 @@ Add this repository with Red's Downloader cog and install `gamewatch`:
 [p]load gamewatch
 ```
 
+To enable `/gamewatch` slash commands (Red 3.5 keeps third-party cog slash commands disabled until enabled by the bot owner):
+
+```text
+[p]slash enablecog gamewatch
+[p]slash sync
+```
+
 To update later:
 
 ```text
 [p]cog update gamewatch
 ```
 
-## Setup
+## Quick Setup
+
+Configure channels and optional role pings per game (you can also use the `[p]gw` shorthand alias for text commands):
 
 ```text
-[p]gamewatch news lol      #lol-patch-notes
-[p]gamewatch status lol    #lol-status
-[p]gamewatch role lol      @League
-
-[p]gamewatch settings      # review everything
-[p]gamewatch games         # list keys
+[p]gamewatch news lol #lol-patch-notes
+[p]gamewatch status lol #lol-status
+[p]gamewatch role lol @League
 ```
 
-Regions default to **EUNE** (`eun1`) for LoL and TFT and `eu` for VALORANT.
-Change with `[p]gamewatch region <game> <region>`; the command provides
-per-game region autocomplete, rejects retired shards (`ph2`/`th2` → `sg2`), and
-validates against Riot before saving.
+Review your configuration or check available game keys:
+
+```text
+[p]gamewatch settings
+[p]gamewatch games
+```
+
+Test immediately without waiting for the next polling cycle:
+
+```text
+[p]gamewatch latest lol
+[p]gamewatch check lol
+```
+
+> **Note on first setup:** On the first news poll for a game, currently visible patch notes are recorded silently so your channel is not flooded with old patches. Only **new** updates published after setup are announced automatically.
+
+### Regions
+
+Riot status feeds require a region ID and default to **`eun1`** (EUNE) for LoL/TFT and **`eu`** for VALORANT. Change per server with `[p]gamewatch region <game> <region>` — the command offers per-game region autocomplete, catches retired shards (`ph2`/`th2` → `sg2`), and validates live against Riot before saving. Status embeds link directly to your configured region on `status.riotgames.com`.
+
+### Discord Permissions
+
+In each configured channel or thread, grant the bot:
+
+- **View Channel** and **Send Messages** (or **Send Messages in Threads** for threads) — required to post updates.
+- **Embed Links** — recommended for rich embeds (falls back cleanly to plain text if missing or disabled via `[p]embedset`).
+- **Role pings** — either make the configured role mentionable or grant the bot **Mention Everyone** (`@everyone` itself cannot be set as a ping role).
+
+`news` and `status` warn you immediately during setup if the bot is missing permissions in the chosen channel.
 
 ## Commands
 
-- `[p]gamewatch games` — supported games and their keys
-- `[p]gamewatch news <game> [channel]` — set/clear the patch-notes channel
-- `[p]gamewatch status <game> [channel]` — set/clear the status channel
-- `[p]gamewatch role <game> [role]` — role pinged for that game
-- `[p]gamewatch region <game> <region>` — Riot region (validated)
-- `[p]gamewatch locations <game> [add|remove|clear|reset] [location]` — manage Riot status location allowlist
-- `[p]gamewatch pingseverity <info|warning|critical>` — ping threshold
-- `[p]gamewatch settings` — current configuration
-- `[p]gamewatch check <game>` — live status on demand
-- `[p]gamewatch latest <game>` — most recent patch notes
-- `[p]gamewatch diag` — (owner) fetch health, latency, and validator status per source
-- `[p]gamewatch forcecheck` — (owner) run both loops immediately
-- `[p]gamewatch resetseen <game>` — (owner) clear dedupe history
+All commands are server-only and hybrid — they work as `[p]gamewatch ...`, `[p]gw ...`, or `/gamewatch ...` (with autocomplete and parameter descriptions once slash commands are enabled).
 
-All commands are hybrid — they work as both `[p]` text commands and slash
-commands (with autocomplete and parameter descriptions) after `[p]slash sync`.
-`news` and `status` accept text channels, announcement channels, and threads.
+| Command | Access | Description |
+|---|---|---|
+| `[p]gamewatch games` | Everyone | List supported games and their keys |
+| `[p]gamewatch settings` | Everyone | Show the current configuration for this server |
+| `[p]gamewatch check <game>` | Everyone | Show live server status on demand (10s channel cooldown) |
+| `[p]gamewatch latest <game>` | Everyone | Show the most recent patch notes on demand (10s channel cooldown) |
+| `[p]gamewatch news <game> [channel]` | Admin / Manage Server | Set the patch-notes channel or thread (omit channel to disable) |
+| `[p]gamewatch status <game> [channel]` | Admin / Manage Server | Set the status-alerts channel or thread (omit channel to disable) |
+| `[p]gamewatch role <game> [role]` | Admin / Manage Server | Set the role pinged for that game (omit role to clear) |
+| `[p]gamewatch region <game> <region>` | Admin / Manage Server | Set the Riot region (`lol`, `tft`, `valorant`; validated live) |
+| `[p]gamewatch locations <game> [add\|remove\|clear\|reset] [location]` | Admin / Manage Server | Manage the opt-in Riot status location allowlist |
+| `[p]gamewatch pingseverity <info\|warning\|critical>` | Admin / Manage Server | Minimum status incident severity that pings the role (default: `warning`) |
+| `[p]gamewatch diag` | Bot Owner | Show fetch health, HTTP status, latency, and validator cache per source |
+| `[p]gamewatch forcecheck` | Bot Owner | Run both status and news loops immediately |
+| `[p]gamewatch resetseen <game>` | Bot Owner | Clear dedupe & status state for a game (news silently re-seeds on next poll) |
+
+Notes:
+- `news` and `status` accept text channels, announcement channels, and threads.
+- `pingseverity` applies only to status incident alerts (default: `warning`). Patch notes always ping the configured role when set; outage recovery messages never ping.
 
 ## Behaviour
 
@@ -113,25 +148,31 @@ commands (with autocomplete and parameter descriptions) after `[p]slash sync`.
 - **Support**: Report bugs or request games via
   [GitHub Issues](https://github.com/ZeD3v/gamewatch/issues).
 
-## Location filter (status noise control)
+## Location filter (optional status noise control)
 
-Riot's VALORANT `eu` deployment is really EMEA and reports incidents for
-Dubai, Bahrain, Cape Town and Tokyo alongside the European servers. Incidents
-that name a game-server location outside the allowlist are suppressed
-(deduped, never re-announced); incidents with no recognisable location always
-announce (fail-open). Default allowlist (closest servers to Latvia): `warsaw`,
-`stockholm`, `frankfurt`, `london`, `paris`.
+Riot's VALORANT `eu` deployment covers all of EMEA and reports individual
+game-server incidents for locations such as Dubai, Bahrain, Cape Town, and
+Tokyo alongside European servers (London, Paris, Frankfurt, Madrid, Warsaw,
+Stockholm, Istanbul).
+
+Location filtering is **disabled by default** so servers in every region
+receive all status alerts out of the box. If you only care about nearby
+servers, add an allowlist — incidents naming a game-server location outside
+your allowlist are suppressed, while incidents with no specific location
+always announce (fail-open).
 
 ```text
-[p]gamewatch locations valorant              show
+[p]gamewatch locations valorant
+[p]gamewatch locations valorant add warsaw, stockholm, frankfurt, london, paris
 [p]gamewatch locations valorant add madrid
 [p]gamewatch locations valorant remove paris
-[p]gamewatch locations valorant clear        disable filtering
-[p]gamewatch locations valorant reset        back to default
+[p]gamewatch locations valorant clear
+[p]gamewatch locations valorant reset
 ```
 
-A region degraded only by filtered locations counts as healthy, so recovery
-messages keep working while far-away incidents linger.
+Multiple locations can be added or removed at once separated by commas. A
+region degraded only by filtered locations counts as healthy for your server,
+so recovery messages still work cleanly while distant incidents linger.
 
 ## Embeds
 

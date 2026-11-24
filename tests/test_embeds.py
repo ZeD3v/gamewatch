@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import discord
+
 from gamewatch.embeds import (
     MAX_AUTHOR,
     MAX_DESC,
@@ -16,6 +18,7 @@ from gamewatch.embeds import (
     _trunc,
     accent_int,
     embed_to_plain_text,
+    fit_embed,
     html_to_markdown,
     incident_embed,
     news_embed,
@@ -167,17 +170,21 @@ def test_html_to_markdown_redos_and_large_input_guard() -> None:
         "<b>" * 20000 + "x" * 20000,
         "<ul>" * 15000 + "<h1>" + "<li>" * 5000,
     ):
+        # Measure wall-clock time without tracemalloc's allocation hooks (which
+        # slow CPython down by ~5-6x and cause false failures on shared CI VMs).
+        start = time.monotonic()
+        out, _ = html_to_markdown(payload, budget=2000)
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.5
+        assert len(out) <= 2000
+
         tracemalloc.start()
         try:
-            start = time.monotonic()
-            out, _ = html_to_markdown(payload, budget=2000)
-            elapsed = time.monotonic() - start
+            html_to_markdown(payload, budget=2000)
             _, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
-        assert elapsed < 0.5
         assert peak < 20 * 1024 * 1024  # well under 20 MiB even for deep list amplification
-        assert len(out) <= 2000
 
     # 75 KB legitimate ABI HTML starting with a 4 KB <style> block still renders body
     large_abi = f"<head><style>{'a{}' * 1400}</style></head><body><h2>Season 7</h2>" + (
@@ -387,3 +394,46 @@ def test_embed_to_plain_text_preserves_key_fields() -> None:
     assert "Patch 26.23 Notes" in text
     assert "Balance updates." in text
     assert "`26.23`" in text
+
+
+def test_riot_status_url_reflects_configured_region_and_fit_embed_caps_desc() -> None:
+    parsed = {
+        "region_id": "NA1",
+        "region_name": "North America",
+        "ok": False,
+        "items": [
+            {
+                "uid": "riot-1",
+                "severity": "warning",
+                "title": "Login issues",
+                "body": "Investigating.",
+            }
+        ],
+    }
+    panel = status_panel_embed("lol", "na1", parsed)
+    assert panel.url == "https://status.riotgames.com/lol?region=na1"
+
+    inc = incident_embed(
+        "valorant", "ap", {**parsed, "region_name": "Asia Pacific"}, parsed["items"][0]
+    )
+    assert any(
+        "https://status.riotgames.com/valorant?region=ap" in (f.value or "") for f in inc.fields
+    )
+
+    rec = recovery_embed("tft", "euw1", {**parsed, "region_name": "EU West"}, None)
+    assert rec.url == "https://status.riotgames.com/teamfighttactics?region=euw1"
+
+    eft_panel = status_panel_embed("eft", "global", {**parsed, "region_name": "Global"})
+    assert eft_panel.url == "https://status.escapefromtarkov.com/"
+
+    # fit_embed enforces MAX_DESC even when aggregate embed length < MAX_TOTAL (6000)
+    long_desc = discord.Embed(title="Settings", description="a " * 2500)
+    assert MAX_DESC < len(long_desc.description or "") < MAX_TOTAL
+    fitted = fit_embed(long_desc)
+    _assert_discord_limits(fitted)
+
+    # Leading space after Steam [*] bullet collapses cleanly
+    bb, _ = steam_bbcode_to_markdown("[list][*]  First bullet[*]   Second bullet[/list]")
+    assert "- First bullet" in bb
+    assert "- Second bullet" in bb
+    assert "-  " not in bb

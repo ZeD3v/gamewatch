@@ -100,6 +100,7 @@ _BB_LEFTOVER_RE = re.compile(
 _TRAILING_WS_RE = re.compile(r"(?<![ \t])[ \t]+\n")
 _MULTI_NL_RE = re.compile(r"\n{3,}")
 _BULLET_GAP_RE = re.compile(r"\n\n(\s*- )")
+_BULLET_LEADING_SPACE_RE = re.compile(r"^([ \t]*- )[ \t]+", re.M)
 _VALVE_SECTION_RE = re.compile(r"^\[ *([A-Z0-9][A-Z0-9 &/_'-]{2,40}?) *\]$", re.M)
 _BOLD_HEADING_RE = re.compile(r"^(#{1,3}) \*\*((?:(?!\*\*).)+)\*\*$", re.M)
 _TRAILING_PIPE_RE = re.compile(r"(?<![ \t])[ \t]+\|[ \t]*$", re.M)
@@ -155,12 +156,14 @@ def _trunc(text: str, limit: int) -> str:
 
 
 def fit_embed(embed: discord.Embed) -> discord.Embed:
-    """Force an embed under the 6000-char aggregate limit.
+    """Force an embed under Discord's description (4096) and aggregate (6000) limits.
 
     discord.py computes len(Embed) exactly as Discord does, so we trim the
     description (the only unbounded part) until it fits. Without this a long
     patch note raises 400 Invalid Form Body and the announcement is lost.
     """
+    if embed.description and len(embed.description) > MAX_DESC:
+        embed.description = _trunc(embed.description, MAX_DESC)
     if len(embed) <= MAX_TOTAL:
         return embed
     overflow = len(embed) - MAX_TOTAL
@@ -302,18 +305,30 @@ def steam_bbcode_to_markdown(
     body = _BB_CELL_CLOSE_RE.sub(" | ", body)
     body = _BB_ROW_CLOSE_RE.sub("\n", body)
 
-    # Headings (strip leading/trailing newlines inside heading content).
-    body = _BB_H12_RE.sub(_heading_repl("##"), body)
-    body = _BB_H36_RE.sub(_heading_repl("###"), body)
+    # Headings and inline styles: guard each paired regex on the presence of its
+    # closing tag so hostile inputs full of unclosed openers (e.g. "[b]" * 5000)
+    # run in O(n) instead of quadratic backtracking.
+    low_body = body.lower()
+    if "[/h1]" in low_body or "[/h2]" in low_body:
+        body = _BB_H12_RE.sub(_heading_repl("##"), body)
+    if any(f"[/h{n}]" in low_body for n in "3456"):
+        body = _BB_H36_RE.sub(_heading_repl("###"), body)
 
     # Inline styles (move outer spaces outside markers for Discord rendering).
-    body = _BB_BOLD_RE.sub(_wrap_inline("**"), body)
-    body = _BB_ITALIC_RE.sub(_wrap_inline("*"), body)
-    body = _BB_UNDERLINE_RE.sub(_wrap_inline("__"), body)
-    body = _BB_STRIKE_RE.sub(_wrap_inline("~~"), body)
-    body = _BB_SPOILER_RE.sub(_wrap_inline("||"), body)
-    body = _BB_CODE_RE.sub(_code_repl, body)
-    body = _BB_QUOTE_RE.sub(r"> \1", body)
+    if "[/b]" in low_body:
+        body = _BB_BOLD_RE.sub(_wrap_inline("**"), body)
+    if "[/i]" in low_body:
+        body = _BB_ITALIC_RE.sub(_wrap_inline("*"), body)
+    if "[/u]" in low_body:
+        body = _BB_UNDERLINE_RE.sub(_wrap_inline("__"), body)
+    if "[/strike]" in low_body:
+        body = _BB_STRIKE_RE.sub(_wrap_inline("~~"), body)
+    if "[/spoiler]" in low_body:
+        body = _BB_SPOILER_RE.sub(_wrap_inline("||"), body)
+    if "[/code]" in low_body:
+        body = _BB_CODE_RE.sub(_code_repl, body)
+    if "[/quote]" in low_body:
+        body = _BB_QUOTE_RE.sub(r"> \1", body)
 
     # Paragraphs become line breaks (supports [p align="center"] etc.).
     body = _BB_P_CLOSE_RE.sub("\n", body)
@@ -323,13 +338,15 @@ def steam_bbcode_to_markdown(
     # Strip known leftover Steam tags BEFORE converting [url=...] -> [label](href)
     # so markdown link labels can never be misread as BBCode tags.
     body = _BB_LEFTOVER_RE.sub("", body)
-    body = _BB_URL_RE.sub(_url_repl, body)
+    if "[/url]" in body.lower():
+        body = _BB_URL_RE.sub(_url_repl, body)
     body = _BB_URL_LEFTOVER_RE.sub("", body)
 
     body = body.replace("\\[", "[").replace("\\]", "]")
     body = body.replace("\u00a0", " ")
     body = _TRAILING_WS_RE.sub("\n", body)
     body = _TRAILING_PIPE_RE.sub("", body)
+    body = _BULLET_LEADING_SPACE_RE.sub(r"\1", body)
     body = _MULTI_NL_RE.sub("\n\n", body)
     body = _BULLET_GAP_RE.sub(r"\n\1", body)
     body = _VALVE_SECTION_RE.sub(r"## \1", body)
@@ -720,6 +737,16 @@ def news_embed(game: str, item: dict, accent: Optional[int] = None) -> discord.E
     return fit_embed(embed)
 
 
+def _status_page_url(cfg: dict, region: str) -> Optional[str]:
+    """Return the official status page URL, formatting the guild's region when templated."""
+    template = cfg.get("status_url")
+    if not template:
+        return None
+    if "{region}" in template:
+        return template.format(region=(region or cfg.get("default_region") or "").lower())
+    return template
+
+
 def incident_embed(game: str, region: str, parsed: dict, item: dict) -> discord.Embed:
     """Build the status-incident embed.
 
@@ -782,10 +809,11 @@ def incident_embed(game: str, region: str, parsed: dict, item: dict) -> discord.
             inline=False,
         )
 
-    if cfg.get("status_url"):
+    status_url = _status_page_url(cfg, region)
+    if status_url:
         embed.add_field(
             name="\u200b",
-            value=f"[Official status page \u2192]({cfg['status_url']})",
+            value=f"[Official status page \u2192]({status_url})",
             inline=False,
         )
 
@@ -802,6 +830,7 @@ def recovery_embed(
     region_name = _trunc(str(parsed.get("region_name") or region.upper()), 80)
     embed = discord.Embed(
         title=f"{RECOVERY_EMOJI} Services back to normal",
+        url=_status_page_url(cfg, region),
         description=f"All monitored services for **{region_name}** are reporting OK.",
         colour=discord.Colour(OK_COLOUR),
         timestamp=datetime.now(timezone.utc),
@@ -845,7 +874,7 @@ def status_panel_embed(game: str, region: str, parsed: dict) -> discord.Embed:
 
     embed = discord.Embed(
         title=_trunc(f"{cfg['name']} \u2014 {region_name}", MAX_TITLE),
-        url=cfg.get("status_url"),
+        url=_status_page_url(cfg, region),
         description=headline,
         colour=discord.Colour(colour),
         timestamp=datetime.now(timezone.utc),

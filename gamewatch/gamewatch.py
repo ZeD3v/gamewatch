@@ -57,13 +57,14 @@ NEWS_INTERVAL = 900  # seconds
 CONFIRM_POLLS = 2  # consecutive bad polls before announcing an incident
 RECOVERY_MIN_SECONDS = 120  # suppress "recovered" for blips shorter than this
 MAX_SEEN_PER_GAME = 80  # ring buffer of announced uids
+MAX_LOCATIONS_PER_GAME = 50  # cap per-guild location allowlist entries
 FAILURE_ALERT_AFTER = 12  # consecutive errors before the owner is DMed
 FETCH_CONCURRENCY = 6  # max simultaneous upstream requests per loop pass
 
 
 class GameWatch(commands.Cog):
     """Per-game server status and patch notes for LoL, TFT, VALORANT, CS2, EFT,
-    ARC Raiders, Arena Breakout and ROB RUN.
+    ARC Raiders, Arena Breakout: Infinite, and ROB RUN.
 
     Status and news are posted to separate, per-game channels. Nothing is
     announced until a channel has been configured for that game.
@@ -91,6 +92,10 @@ class GameWatch(commands.Cog):
         self._last_health: dict[str, dict[str, Any]] = {}
         self._pending: dict[str, int] = {}  # game-region -> consecutive active bad polls
         self._pending_scheduled: dict[str, int] = {}  # game-region -> consecutive scheduled polls
+        # Guilds that actually received an active outage alert for game-region,
+        # so guilds whose location filter suppressed the outage don't get a
+        # confusing recovery notice when another guild had filtering disabled.
+        self._notified_guilds: dict[str, set[int]] = {}
         # Last successful parse per status source, so a 304 (unchanged payload)
         # can still be fed through the debounce/recovery state machine.
         self._last_parsed: dict[str, ParsedStatus] = {}
@@ -302,6 +307,37 @@ class GameWatch(commands.Cog):
         except TypeError:
             return True
 
+    @staticmethod
+    def _unknown_game_message() -> str:
+        return f"Unknown game. Valid keys: {humanize_list([f'`{g}`' for g in GAMES])}"
+
+    @staticmethod
+    def _channel_permission_warning(channel: TargetChannel) -> str:
+        me = getattr(channel.guild, "me", None)
+        if me is None:
+            return ""
+        perms = channel.permissions_for(me)
+        missing_send: list[str] = []
+        if not perms.view_channel:
+            missing_send.append("View Channel")
+        if isinstance(channel, discord.Thread):
+            if not perms.send_messages_in_threads:
+                missing_send.append("Send Messages in Threads")
+        elif not perms.send_messages:
+            missing_send.append("Send Messages")
+        notes: list[str] = []
+        if missing_send:
+            notes.append(
+                f"\u26a0\ufe0f I am missing {humanize_list(missing_send)} in {channel.mention}, "
+                "so announcements cannot be posted until those permissions are granted."
+            )
+        if not perms.embed_links:
+            notes.append(
+                f"\u2139\ufe0f I lack Embed Links in {channel.mention}; "
+                "updates will fall back to plain text until it is granted."
+            )
+        return ("\n" + "\n".join(notes)) if notes else ""
+
     async def _send_ctx_embed(
         self,
         ctx: commands.Context,
@@ -310,12 +346,15 @@ class GameWatch(commands.Cog):
         allowed_mentions: Optional[discord.AllowedMentions] = None,
     ) -> None:
         """Send an embed in a command response, honouring ctx.embed_requested()."""
+        mentions = (
+            allowed_mentions if allowed_mentions is not None else discord.AllowedMentions.none()
+        )
         if await ctx.embed_requested():
-            await ctx.send(embed=embed, allowed_mentions=allowed_mentions)
+            await ctx.send(embed=embed, allowed_mentions=mentions)
             return
         text = embed_to_plain_text(embed) or "No details available."
         for page in pagify(text, page_length=1990):
-            await ctx.send(page, allowed_mentions=allowed_mentions)
+            await ctx.send(page, allowed_mentions=mentions)
 
     async def _send(
         self,
@@ -330,8 +369,10 @@ class GameWatch(commands.Cog):
             if isinstance(channel, discord.Thread)
             else perms.send_messages
         )
-        if not can_send:
-            log.warning("Missing send permission in #%s (%s)", channel.name, channel.guild.name)
+        if not (perms.view_channel and can_send):
+            log.warning(
+                "Missing view/send permission in #%s (%s)", channel.name, channel.guild.name
+            )
             return
         role_objs = []
         if ping_role:
@@ -547,6 +588,8 @@ class GameWatch(commands.Cog):
         self, game: str, region: str, parsed: dict, item: dict, targets: list
     ) -> None:
         cfg = GAMES[game]
+        state_key = f"{game}-{region}"
+        is_active = item.get("maintenance_status") != "scheduled"
         severity = (item.get("severity") or "info").lower()
         embed = incident_embed(game, region, parsed, item)
 
@@ -574,10 +617,13 @@ class GameWatch(commands.Cog):
                 role_id = gcfg["role"]
                 content = f"<@&{role_id}>"
             await self._send(channel, embed, content, ping_role=role_id)
+            if is_active:
+                self._notified_guilds.setdefault(state_key, set()).add(guild.id)
 
     async def _announce_recovery(self, game: str, region: str, parsed: dict, targets: list) -> None:
         cfg = GAMES[game]
         state_key = f"{game}-{region}"
+        notified = self._notified_guilds.pop(state_key, None)
         down_since = None
         stored = (await self.config.last_status()).get(state_key) or {}
         if stored.get("since"):
@@ -588,6 +634,8 @@ class GameWatch(commands.Cog):
         embed = recovery_embed(game, region, parsed, down_since)
         for guild, gcfg in targets:
             if (gcfg.get("region") or cfg.get("default_region")) != region:
+                continue
+            if notified is not None and guild.id not in notified:
                 continue
             channel = self._resolve_channel(guild, gcfg.get("status_channel"))
             if channel:
@@ -835,8 +883,8 @@ class GameWatch(commands.Cog):
             )
         embed.set_footer(
             text=(
-                "CS2, ARC Raiders, Arena Breakout and ROB RUN publish no keyless status API, "
-                "so they are patch notes only."
+                "CS2, ARC Raiders, Arena Breakout: Infinite, and ROB RUN publish no keyless "
+                "status API, so they are patch notes only."
             )
         )
         await self._send_ctx_embed(ctx, fit_embed(embed))
@@ -854,15 +902,16 @@ class GameWatch(commands.Cog):
         """Set the patch-notes channel for a game. Omit the channel to clear it."""
         game = game.lower()
         if game not in GAMES:
-            return await ctx.send(
-                f"Unknown game. Valid keys: {humanize_list([f'`{g}`' for g in GAMES])}"
-            )
+            return await ctx.send(self._unknown_game_message())
         async with self.config.guild(ctx.guild).games() as games:
             entry = games.setdefault(game, {})
             entry["news_channel"] = channel.id if channel else None
             entry.setdefault("enabled", True)
         if channel:
-            await ctx.send(f"{GAMES[game]['name']} patch notes will post to {channel.mention}.")
+            warn = self._channel_permission_warning(channel)
+            await ctx.send(
+                f"{GAMES[game]['name']} patch notes will post to {channel.mention}.{warn}"
+            )
         else:
             await ctx.send(f"{GAMES[game]['name']} patch notes disabled.")
 
@@ -876,12 +925,10 @@ class GameWatch(commands.Cog):
     async def gw_status(
         self, ctx: commands.Context, game: str, channel: Optional[TargetChannel] = None
     ) -> None:
-        """Set the status/incident channel for a game."""
+        """Set the status/incident channel for a game. Omit the channel to clear it."""
         game = game.lower()
         if game not in GAMES:
-            return await ctx.send(
-                f"Unknown game. Valid keys: {humanize_list([f'`{g}`' for g in GAMES])}"
-            )
+            return await ctx.send(self._unknown_game_message())
         if GAMES[game]["status_kind"] is None:
             return await ctx.send(
                 f"{GAMES[game]['name']} has no public keyless status API, so status monitoring "
@@ -892,8 +939,19 @@ class GameWatch(commands.Cog):
             entry["status_channel"] = channel.id if channel else None
             entry.setdefault("region", GAMES[game]["default_region"])
             entry.setdefault("enabled", True)
+            active_region = entry["region"]
         if channel:
-            await ctx.send(f"{GAMES[game]['name']} status alerts will post to {channel.mention}.")
+            warn = self._channel_permission_warning(channel)
+            region_hint = ""
+            if GAMES[game]["status_kind"] == "riot":
+                region_hint = (
+                    f" (region: `{active_region}` \u2014 change with "
+                    f"`{ctx.clean_prefix}gamewatch region {game} <region>`)"
+                )
+            await ctx.send(
+                f"{GAMES[game]['name']} status alerts will post to {channel.mention}"
+                f"{region_hint}.{warn}"
+            )
         else:
             await ctx.send(f"{GAMES[game]['name']} status alerts disabled.")
 
@@ -910,12 +968,26 @@ class GameWatch(commands.Cog):
         """Set the role pinged for a game. Omit the role to clear it."""
         game = game.lower()
         if game not in GAMES:
-            return await ctx.send("Unknown game.")
+            return await ctx.send(self._unknown_game_message())
+        if role is not None and role.is_default():
+            return await ctx.send(
+                "Cannot use `@everyone` as a GameWatch ping role. Choose a dedicated role instead."
+            )
         async with self.config.guild(ctx.guild).games() as games:
             entry = games.setdefault(game, {})
             entry["role"] = role.id if role else None
+        warn = ""
+        if role is not None and not role.mentionable:
+            me = getattr(ctx.guild, "me", None)
+            guild_perms = getattr(me, "guild_permissions", None)
+            if guild_perms is not None and not guild_perms.mention_everyone:
+                warn = (
+                    "\n\u26a0\ufe0f Note: that role is not mentionable and I lack the "
+                    "Mention Everyone permission, so pings will not notify members until "
+                    "one of those is enabled."
+                )
         await ctx.send(
-            f"{GAMES[game]['name']} pings {role.mention if role else 'nobody'}.",
+            f"{GAMES[game]['name']} pings {role.mention if role else 'nobody'}.{warn}",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -968,7 +1040,7 @@ class GameWatch(commands.Cog):
     @app_commands.describe(
         game="Riot game key (e.g. valorant)",
         action="Action: add, remove, clear, or reset (omit to view)",
-        location="Server location name (e.g. warsaw, madrid)",
+        location="Server location(s), comma-separated (e.g. warsaw or warsaw, frankfurt)",
     )
     @app_commands.autocomplete(game=_riot_game_autocomplete, action=_location_action_autocomplete)
     async def gw_locations(
@@ -995,25 +1067,44 @@ class GameWatch(commands.Cog):
                 else humanize_list([f"`{a}`" for a in current])
             )
             src = "custom" if entry.get("location_allow") is not None else "default"
-            dflt = humanize_list([f"`{a}`" for a in default]) if default else "none"
+            dflt = (
+                humanize_list([f"`{a}`" for a in default])
+                if default
+                else "none (all locations announce)"
+            )
             return await ctx.send(f"{name} allowlist ({src}): {state}\nDefault: {dflt}")
 
         action = action.lower()
         if action in ("add", "remove"):
             if not location:
-                return await ctx.send(f"Usage: `locations {game} {action} <location>`")
-            loc = location.lower().strip()
-            if not re.fullmatch(r"[a-z0-9 ,.\-]{1,40}", loc):
-                return await ctx.send("Locations are short plain-text names like `warsaw`.")
-            new = [a for a in current if a != loc]
+                return await ctx.send(
+                    f"Usage: `{ctx.clean_prefix}gamewatch locations {game} {action} <location>`"
+                )
+            locs = [part.strip() for part in location.lower().split(",") if part.strip()]
+            if not locs or any(not re.fullmatch(r"[a-z0-9 .\-]{1,40}", loc) for loc in locs):
+                return await ctx.send(
+                    "Locations are short plain-text names like `warsaw` "
+                    "(separate multiple with commas)."
+                )
+            new_set = set(current)
             if action == "add":
-                new.append(loc)
-            elif len(new) == len(current):
-                return await ctx.send(f"`{loc}` is not on the list.")
+                new_set.update(locs)
+                if len(new_set) > MAX_LOCATIONS_PER_GAME:
+                    return await ctx.send(
+                        f"Allowlist cannot exceed {MAX_LOCATIONS_PER_GAME} locations."
+                    )
+            else:
+                missing = [loc for loc in locs if loc not in new_set]
+                if len(missing) == len(locs):
+                    return await ctx.send(
+                        f"{humanize_list([f'`{m}`' for m in missing])} not on the list."
+                    )
+                new_set.difference_update(locs)
+            updated = sorted(new_set)
             async with self.config.guild(ctx.guild).games() as games:
-                games.setdefault(game, {})["location_allow"] = sorted(new)
+                games.setdefault(game, {})["location_allow"] = updated
             shown = (
-                humanize_list([f"`{a}`" for a in sorted(new)]) if new else "empty (filter disabled)"
+                humanize_list([f"`{a}`" for a in updated]) if updated else "empty (filter disabled)"
             )
             return await ctx.send(f"{name} allowlist is now: {shown}")
         if action == "clear":
@@ -1023,7 +1114,11 @@ class GameWatch(commands.Cog):
         if action == "reset":
             async with self.config.guild(ctx.guild).games() as games:
                 games.setdefault(game, {}).pop("location_allow", None)
-            dflt = humanize_list([f"`{a}`" for a in default]) if default else "none (no default)"
+            dflt = (
+                humanize_list([f"`{a}`" for a in default])
+                if default
+                else "none (all locations announce)"
+            )
             return await ctx.send(f"{name} allowlist reset to default: {dflt}")
         await ctx.send("Actions: `add`, `remove`, `clear`, `reset`, or no action to show.")
 
@@ -1073,13 +1168,14 @@ class GameWatch(commands.Cog):
         )
 
     @gamewatch.command(name="check")
+    @commands.cooldown(1, 10, commands.BucketType.channel)
     @app_commands.describe(game="Game key with status monitoring (lol, tft, valorant, eft)")
     @app_commands.autocomplete(game=_status_game_autocomplete)
     async def gw_check(self, ctx: commands.Context, game: str) -> None:
         """Check a game's live status right now."""
         game = game.lower()
         if game not in GAMES:
-            return await ctx.send("Unknown game.")
+            return await ctx.send(self._unknown_game_message())
         cfg = GAMES[game]
         if cfg["status_kind"] is None:
             return await ctx.send(
@@ -1111,13 +1207,14 @@ class GameWatch(commands.Cog):
         await self._send_ctx_embed(ctx, embed)
 
     @gamewatch.command(name="latest")
+    @commands.cooldown(1, 10, commands.BucketType.channel)
     @app_commands.describe(game="Game key (e.g. lol, cs2, valorant, robrun)")
     @app_commands.autocomplete(game=_game_autocomplete)
     async def gw_latest(self, ctx: commands.Context, game: str) -> None:
         """Show the most recent patch notes for a game."""
         game = game.lower()
         if game not in GAMES:
-            return await ctx.send("Unknown game.")
+            return await ctx.send(self._unknown_game_message())
         cfg = GAMES[game]
         async with ctx.typing():
             session = self._get_session()
@@ -1195,16 +1292,29 @@ class GameWatch(commands.Cog):
     @app_commands.describe(game="Game key whose dedupe history should be cleared")
     @app_commands.autocomplete(game=_game_autocomplete)
     async def gw_resetseen(self, ctx: commands.Context, game: str) -> None:
-        """Clear the dedupe history for a game (it will re-announce the next item)."""
+        """Clear dedupe history for a game and re-seed news silently on next poll."""
         game = game.lower()
         if game not in GAMES:
-            return await ctx.send("Unknown game.")
+            return await ctx.send(self._unknown_game_message())
         async with self.config.seen() as seen:
             for key in (game, f"news:{game}", f"status:{game}"):
                 seen.pop(key, None)
         async with self.config.bootstrapped() as boot:
             boot[game] = False
+        prefix = f"{game}-"
+        async with self.config.last_status() as store:
+            for skey in [k for k in store if k.startswith(prefix)]:
+                store.pop(skey, None)
         self._validators.pop(f"news-{game}", None)
         for skey in [k for k in self._validators if k.startswith(f"status-{game}-")]:
             self._validators.pop(skey, None)
-        await ctx.send(f"Dedupe history cleared for {GAMES[game]['name']}.")
+        for skey in [k for k in self._last_parsed if k.startswith(f"status-{game}-")]:
+            self._last_parsed.pop(skey, None)
+        for mapping in (self._pending, self._pending_scheduled, self._notified_guilds):
+            for skey in [k for k in mapping if k.startswith(prefix)]:
+                mapping.pop(skey, None)
+        await ctx.send(
+            f"Dedupe history cleared for {GAMES[game]['name']}. "
+            "Existing patch notes will be re-seeded silently on the next poll; "
+            "only newer updates will announce."
+        )

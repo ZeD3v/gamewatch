@@ -230,6 +230,23 @@ async def test_hybrid_commands_channel_types_and_autocomplete(patched_config) ->
     act_choices = await cog._location_action_autocomplete(None, "re")  # type: ignore[arg-type]
     assert {c.value for c in act_choices} == {"remove", "reset"}
 
+    # All hybrid slash commands & parameter descriptions fit Discord's 100-char cap
+    app_group = cog.gamewatch.app_command
+    assert app_group.guild_only is True
+    tree_dict = app_group.to_dict(
+        discord.app_commands.CommandTree(discord.Client(intents=discord.Intents.none()))
+    )
+    assert len(tree_dict["description"]) <= 100
+    assert len(tree_dict["options"]) == 13
+    for opt in tree_dict["options"]:
+        assert 1 <= len(opt["description"]) <= 100
+        for param in opt.get("options", []):
+            assert 1 <= len(param["description"]) <= 100
+
+    # Public upstream-fetching commands have a channel cooldown
+    assert cmds["gamewatch check"]._buckets._cooldown is not None
+    assert cmds["gamewatch latest"]._buckets._cooldown is not None
+
     await cog.cog_unload()
 
 
@@ -750,17 +767,31 @@ async def test_concurrent_loops_isolate_failures_validators_and_lazy_abi_detail(
     with pytest.raises(asyncio.CancelledError):
         await cog._check_news_once()
 
-    # resetseen must clear cached validators so next poll re-bootstraps instead of getting 304
+    # resetseen must clear cached validators and status state so next poll starts fresh
     cog._validators["news-lol"] = {"last_modified": "Thu, 19 Nov 2026 10:00:00 GMT"}
     cog._validators["status-lol-eun1"] = {"etag": '"e1"'}
+    cog._last_parsed["status-lol-eun1"] = _make_parsed(False)  # type: ignore[assignment]
+    cog._pending["lol-eun1"] = 1
+    cog._pending_scheduled["lol-eun1"] = 1
+    cog._notified_guilds["lol-eun1"] = {1}
+    async with cog.config.last_status() as ls:
+        ls["lol-eun1"] = {"ok": False, "since": "2026-11-19T10:00:00+00:00"}
+
+    reset_msgs: list[str] = []
 
     class FakeResetCtx:
         async def send(self, content=None, **kwargs):
-            return None
+            reset_msgs.append(str(content))
 
     await cog.gw_resetseen.callback(cog, FakeResetCtx(), "lol")  # type: ignore[arg-type]
     assert "news-lol" not in cog._validators
     assert "status-lol-eun1" not in cog._validators
+    assert "status-lol-eun1" not in cog._last_parsed
+    assert "lol-eun1" not in cog._pending
+    assert "lol-eun1" not in cog._pending_scheduled
+    assert "lol-eun1" not in cog._notified_guilds
+    assert "lol-eun1" not in (await cog.config.last_status())
+    assert any("re-seeded silently" in m for m in reset_msgs)
 
     await cog.cog_unload()
 
@@ -779,6 +810,7 @@ async def test_multiguild_location_isolation_and_embed_fallback(patched_config) 
 
         def permissions_for(self, member):
             return SimpleNamespace(
+                view_channel=True,
                 send_messages=True,
                 send_messages_in_threads=True,
                 embed_links=True,
@@ -815,9 +847,104 @@ async def test_multiguild_location_isolation_and_embed_fallback(patched_config) 
     assert sent[0][1]["embed"] is None
     assert "Dubai" in (sent[0][1]["content"] or "")
 
-    # Warsaw goes to BOTH guilds
+    # Recovery for that Dubai-only outage must go ONLY to guild_b, never guild_a
+    sent.clear()
+    await cog._announce_recovery("valorant", "eu", _loc_parsed([]), targets)
+    assert [cid for cid, _ in sent] == [1002]
+
+    # Warsaw goes to BOTH guilds, so recovery after Warsaw goes to BOTH guilds
     sent.clear()
     await cog._announce_incident("valorant", "eu", parsed, parsed["items"][1], targets)
     assert [cid for cid, _ in sent] == [1001, 1002]
+    sent.clear()
+    await cog._announce_recovery("valorant", "eu", _loc_parsed([]), targets)
+    assert [cid for cid, _ in sent] == [1001, 1002]
+
+    await cog.cog_unload()
+
+
+async def test_public_defaults_locations_comma_split_role_and_permission_warnings(
+    patched_config,
+) -> None:
+    cog = module.GameWatch(FakeBot())  # type: ignore[arg-type]
+    # Default location allowlist is empty so non-EU / global regions never lose alerts
+    assert cog._effective_allowlist({}, "valorant") == []
+
+    msgs: list[str] = []
+
+    class FakeChannel:
+        def __init__(self, cid: int, guild, *, send_ok: bool, embed_ok: bool) -> None:
+            self.id = cid
+            self.mention = f"<#{cid}>"
+            self.guild = guild
+            self._send_ok = send_ok
+            self._embed_ok = embed_ok
+
+        def permissions_for(self, member):
+            return SimpleNamespace(
+                view_channel=self._send_ok,
+                send_messages=self._send_ok,
+                send_messages_in_threads=self._send_ok,
+                embed_links=self._embed_ok,
+            )
+
+    class FakeRole:
+        def __init__(self, rid: int, *, default: bool = False, mentionable: bool = True) -> None:
+            self.id = rid
+            self.mention = f"<@&{rid}>"
+            self._default = default
+            self.mentionable = mentionable
+
+        def is_default(self) -> bool:
+            return self._default
+
+    guild = SimpleNamespace(
+        id=55,
+        me=SimpleNamespace(guild_permissions=SimpleNamespace(mention_everyone=False)),
+    )
+
+    class FakeCtx:
+        clean_prefix = "!"
+
+        def __init__(self) -> None:
+            self.guild = guild
+
+        async def send(self, content=None, **kwargs):
+            msgs.append(str(content))
+
+    ctx = FakeCtx()
+
+    # Comma-separated locations add & remove
+    await cog.gw_locations.callback(
+        cog, ctx, "valorant", "add", location="Warsaw, Frankfurt, paris"
+    )  # type: ignore[arg-type]
+    gcfg = await cog._guild_game_cfg(guild, "valorant")  # type: ignore[arg-type]
+    assert gcfg["location_allow"] == ["frankfurt", "paris", "warsaw"]
+
+    await cog.gw_locations.callback(cog, ctx, "valorant", "remove", location="paris, frankfurt")  # type: ignore[arg-type]
+    gcfg = await cog._guild_game_cfg(guild, "valorant")  # type: ignore[arg-type]
+    assert gcfg["location_allow"] == ["warsaw"]
+
+    # gw_role rejects @everyone and warns on non-mentionable role without mention_everyone
+    msgs.clear()
+    await cog.gw_role.callback(cog, ctx, "lol", FakeRole(55, default=True))  # type: ignore[arg-type]
+    assert any("@everyone" in m for m in msgs)
+    assert (await cog._guild_game_cfg(guild, "lol")).get("role") is None  # type: ignore[arg-type]
+
+    msgs.clear()
+    await cog.gw_role.callback(cog, ctx, "lol", FakeRole(99, mentionable=False))  # type: ignore[arg-type]
+    assert any("not mentionable" in m for m in msgs)
+    assert (await cog._guild_game_cfg(guild, "lol")).get("role") == 99  # type: ignore[arg-type]
+
+    # gw_news warns on missing send/embed permissions; gw_status also reminds Riot region
+    msgs.clear()
+    bad_ch = FakeChannel(700, guild, send_ok=False, embed_ok=False)
+    await cog.gw_news.callback(cog, ctx, "lol", bad_ch)  # type: ignore[arg-type]
+    assert any("missing" in m.lower() and "embed links" in m.lower() for m in msgs)
+
+    msgs.clear()
+    ok_ch = FakeChannel(701, guild, send_ok=True, embed_ok=True)
+    await cog.gw_status.callback(cog, ctx, "lol", ok_ch)  # type: ignore[arg-type]
+    assert any("eun1" in m and "!gamewatch region lol" in m for m in msgs)
 
     await cog.cog_unload()

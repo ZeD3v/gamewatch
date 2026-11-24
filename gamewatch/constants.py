@@ -197,7 +197,7 @@ GAMES = {
         "news_base": "https://www.leagueoflegends.com",
         "title_filter": r"(?i)patch.*notes",
         "site": "https://www.leagueoflegends.com/en-us/news/tags/patch-notes/",
-        "status_url": "https://status.riotgames.com/lol?region=eun1",
+        "status_url": "https://status.riotgames.com/lol?region={region}",
         # Sanity CDN favicon. ?fm=png converts the SVG, because Discord will
         # not render an image/svg+xml embed icon.
         "icon": ICON_LOL,
@@ -220,7 +220,7 @@ GAMES = {
         "news_base": "https://teamfighttactics.leagueoflegends.com",
         "title_filter": r"(?i)patch",
         "site": "https://teamfighttactics.leagueoflegends.com/en-us/news/tags/patch-notes/",
-        "status_url": "https://status.riotgames.com/teamfighttactics?region=eun1",
+        "status_url": "https://status.riotgames.com/teamfighttactics?region={region}",
         "icon": ICON_TFT,
         "art": None,
         "source_label": "Riot Games",
@@ -241,7 +241,7 @@ GAMES = {
         "news_base": "https://playvalorant.com",
         "title_filter": r"(?i)patch notes",
         "site": "https://playvalorant.com/en-us/news/tags/patch-notes/",
-        "status_url": "https://status.riotgames.com/valorant?region=eu",
+        "status_url": "https://status.riotgames.com/valorant?region={region}",
         "icon": ICON_VAL,
         "art": None,
         "source_label": "Riot Games",
@@ -394,12 +394,10 @@ USER_AGENT = "Red-DiscordBot GameWatch cog (+https://github.com/ZeD3v/gamewatch)
 # ---------------------------------------------------------------------------
 # Default location allowlists (per game key). Applied only to status
 # incidents that name a specific game-server location (fail-open otherwise).
-# Valorant's "eu" deployment is really EMEA: London, Paris, Frankfurt,
-# Madrid, Warsaw, Stockholm, Istanbul + Bahrain + Cape Town + Tokyo
-# (cross-checked valorfeed.gg + gameserverping.com, 2026-09-12). Defaults
-# below = closest playable servers to Latvia. Matching is case-insensitive
-# substring. Empty/missing = filter disabled for that game.
+# Disabled by default (empty) so servers in any region receive all status
+# alerts out of the box. Admins on wide deployments like VALORANT's "eu"
+# (EMEA: London, Paris, Frankfurt, Madrid, Warsaw, Stockholm, Istanbul,
+# Dubai, Bahrain, Cape Town, Tokyo) can opt in via `[p]gamewatch locations`.
+# Matching is case-insensitive substring. Empty/missing = filter disabled.
 # ---------------------------------------------------------------------------
-DEFAULT_LOCATION_ALLOW: dict[str, list[str]] = {
-    "valorant": ["warsaw", "stockholm", "frankfurt", "london", "paris"],
-}
+DEFAULT_LOCATION_ALLOW: dict[str, list[str]] = {}

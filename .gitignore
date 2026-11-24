@@ -13,7 +13,7 @@ env/
 .pytest_cache/
 .mypy_cache/
 
-# Local runtime state / snapshots (e.g. live Red settings.json from NAS)
+# Local runtime state / snapshots (e.g. exported Red settings.json)
 local/
 settings.json
 
